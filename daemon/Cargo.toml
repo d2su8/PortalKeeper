@@ -1,0 +1,28 @@
+[package]
+name = "portalkeeper"
+version = "1.0.0"
+edition = "2021"
+description = "PortalKeeper 校园网自动认证守护进程 (OpenWrt)"
+
+[[bin]]
+# 二进制叫 portalkeeperd(与 init 脚本 /etc/init.d/portalkeeper 区分开:
+# 脚本名与进程同名时, busybox 的 pidof 会把脚本自己也算进去, 判活/停止记录会误判)
+name = "portalkeeperd"
+path = "src/main.rs"
+
+[dependencies]
+# 门户为明文 HTTP, 手写最小客户端; socket2 用于绑定源 IP / 出口网卡(多线多拨必需)
+# features=all: 启用 bind_device(SO_BINDTODEVICE, 按网卡出流量的关键)
+socket2 = { version = "0.5", features = ["all"] }
+serde_json = "1"
+# 门户个别流程页为 GBK, 需要 utf-8 → gbk 容错解码
+encoding_rs = "0.8"
+# 捕获 SIGTERM/SIGINT, 让「守护进程退出」能写进日志(procd 停止服务时发 SIGTERM)
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

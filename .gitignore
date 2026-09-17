@@ -1,0 +1,10 @@
+# 构建产物
+daemon/target/
+build/out/
+
+# 打包时放进包目录的二进制(由 build-ipk.sh 生成, 不入库)
+portalkeeper/files/usr/bin/portalkeeperd
+
+# 本地运行时数据(含账号密码, 绝不入库)
+*.dat
+*.log

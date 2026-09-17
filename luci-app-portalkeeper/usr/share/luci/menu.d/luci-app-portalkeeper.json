@@ -1,0 +1,29 @@
+{
+	"admin/services/portalkeeper": {
+		"title": "PortalKeeper",
+		"order": 65,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-portalkeeper" ] }
+	},
+
+	"admin/services/portalkeeper/overview": {
+		"title": "概览",
+		"order": 1,
+		"action": { "type": "view", "path": "portalkeeper/overview" },
+		"depends": { "acl": [ "luci-app-portalkeeper" ] }
+	},
+
+	"admin/services/portalkeeper/advanced": {
+		"title": "高级设置",
+		"order": 2,
+		"action": { "type": "view", "path": "portalkeeper/advanced" },
+		"depends": { "acl": [ "luci-app-portalkeeper" ] }
+	},
+
+	"admin/services/portalkeeper/log": {
+		"title": "日志",
+		"order": 3,
+		"action": { "type": "view", "path": "portalkeeper/log" },
+		"depends": { "acl": [ "luci-app-portalkeeper" ] }
+	}
+}

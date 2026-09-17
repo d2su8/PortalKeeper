@@ -1,0 +1,28 @@
+#!/bin/sh
+# 首次安装时创建默认配置(已存在则不动, 升级不覆盖用户配置)
+[ -f /etc/config/portalkeeper ] || cat > /etc/config/portalkeeper <<'EOF'
+config portalkeeper 'main'
+	option enabled '0'
+	option username ''
+	option password ''
+	option ua 'pc'
+	option device ''
+	option source ''
+	option auto_retry '1'
+	option retry_interval '60'
+	option retry_count '3'
+	option probe_url ''
+
+config line 'extra'
+	option enabled '0'
+	option device ''
+	option source ''
+	option username ''
+	option password ''
+	option ua 'mobile'
+EOF
+
+# 建立开机启动链接(start 内部按 enabled 门控是否真正运行)
+[ -x /etc/init.d/portalkeeper ] && /etc/init.d/portalkeeper enable
+
+exit 0

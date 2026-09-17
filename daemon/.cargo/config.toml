@@ -1,0 +1,6 @@
+# aarch64 musl 静态链接(OpenWrt mediatek/filogic, 如 CMCC RAX3000M)。
+# 前提: PATH 中可找到 aarch64-linux-musl-gcc (见 BUILD.md 第 0 步)。
+# 如工具链装在别处, 请把 linker 改成绝对路径。
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-s"]
