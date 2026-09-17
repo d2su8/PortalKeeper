@@ -369,6 +369,14 @@ return view.extend({
 		o.rmempty = true;
 		o.placeholder = 'www.msftconnecttest.com/connecttest.txt';
 
+		o = sec.option(form.Value, 'portal_url', _('门户地址'),
+			'tip: 认证服务器地址。留空 = 自动发现(未认证时网关会 302 劫持, 程序直接跟着跳转地址走, ' +
+			'换学校通常不用填); 探测不到时才需要手填 —— 浏览器打开任意 http 网站(如 ' +
+			'http://www.msftconnecttest.com/connecttest.txt), 把地址栏跳转后的地址整条粘过来。');
+		o.default = '';
+		o.rmempty = true;
+		o.placeholder = 'http://10.10.0.1 (留空=自动发现)';
+
 		// 注意: form.Map.render() 返回 Promise(异步渲染), 必须等它 resolve 后
 		// 再拼进页面, 否则会显示成 [object Promise] 且表单缺失
 		var self = this;

@@ -12,6 +12,7 @@ config portalkeeper 'main'
 	option retry_interval '60'
 	option retry_count '3'
 	option probe_url ''
+	option portal_url ''
 
 config line 'extra'
 	option enabled '0'

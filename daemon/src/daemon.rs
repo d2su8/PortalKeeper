@@ -106,6 +106,8 @@ fn human_duration(secs: u64) -> String {
 struct LineRun {
     /// uci 段名(主线路 main / 扩展线路 extra)
     name: String,
+    /// 手动门户地址(取自主段 portal_url, 两条线路共用)
+    portal_url: String,
     role: &'static str,
     device: Option<String>,
     source: Option<Ipv4Addr>,
@@ -151,10 +153,16 @@ pub fn run(rest: &[String]) {
         .and_then(|m| uci::get(m, "probe_url"))
         .unwrap_or("")
         .to_string();
+    // 手动填写的门户地址(空 = 只用 302 劫持自动发现); 换学校时不用改代码
+    let portal_url = main
+        .and_then(|m| uci::get(m, "portal_url"))
+        .unwrap_or("")
+        .to_string();
 
     // 线路 1: 主 WAN(基本设置), 段名 main
     let mut lines: Vec<LineRun> = vec![LineRun {
         name: "main".into(),
+        portal_url: portal_url.clone(),
         role: "主 WAN",
         device: main
             .and_then(|m| uci::get(m, "device"))
@@ -197,6 +205,7 @@ pub fn run(rest: &[String]) {
                 .or_else(|| portal::resolve_source(device.as_deref()));
             lines.push(LineRun {
                 name: "extra".into(),
+                portal_url: portal_url.clone(),
                 role: "扩展线路",
                 device,
                 source,
@@ -368,6 +377,7 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
             logging::log(&format!("[{}] 检测到掉线(被门户劫持), 开始认证...", lr.role));
             let line = LineCfg {
                 name: lr.name.clone(),
+                portal_url: lr.portal_url.clone(),
                 device: lr.device.clone(),
                 source: lr.source,
                 username: lr.username.clone(),

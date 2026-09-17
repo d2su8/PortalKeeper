@@ -5,6 +5,7 @@
 //!   check    联通测试: 仅探测认证状态, 不登录 (退出码 0=已在线 1=未认证/失败 2=无法判定)
 //!   login    手动执行一次完整认证(探测→登录→复核)
 //!   status   打印守护进程写入的线路状态
+//!   detect-portal  只探测门户地址(不登录, 排查用)
 //!
 //! 门户认证协议(逐字段实机验证, 与同系列桌面版同源):
 //!   未认证时 AC 302 劫持任意 HTTP → 向带 query 的门户 URL POST B 组字段+账号密码
@@ -28,11 +29,13 @@ fn usage() {
   portalkeeperd check             联通测试: 仅探测, 不登录(0=已在线 1=未认证/失败 2=无法判定)\n\
   portalkeeperd login             手动执行一次完整认证\n\
   portalkeeperd status            查看守护进程线路状态(/tmp/portalkeeper.status)\n\
+  portalkeeperd detect-portal     只探测门户地址(不登录); 探测不到会给出手动获取办法\n\
 选项(check/login 可用):\n\
   --config PATH                   UCI 配置文件(默认 /etc/config/portalkeeper)\n\
   --source IP                     覆盖源 IP\n\
   --device NAME                   覆盖出口网卡(如 eth1)\n\
   --ua pc|mobile                  覆盖设备槽位\n\
+  --portal URL                    手动指定门户地址(留空=靠 302 劫持自动发现)\n\
   --timeout SECS                  单请求超时(默认 5)\n\
 说明:\n\
   - 必需配置: uci 的 portalkeeper.main.username + password —— 缺任一项服务就不启动,\n\
@@ -53,6 +56,7 @@ fn main() {
         "check" => cli_check(rest),
         "login" => cli_login(rest),
         "status" => cli_status(),
+        "detect-portal" => cli_detect_portal(rest),
         "version" | "--version" | "-v" => println!("portalkeeperd {}", VERSION),
         "help" | "--help" | "-h" => usage(),
         _ => {
@@ -134,10 +138,20 @@ fn resolve_line(rest: &[String]) -> (portal::LineCfg, String) {
         .and_then(|m| uci::get(m, "probe_url"))
         .unwrap_or("")
         .to_string();
+    // 门户地址: --portal 优先, 其次 uci 里的 portal_url
+    let portal_url = arg_value(rest, "--portal")
+        .or_else(|| {
+            main_sec
+                .and_then(|m| uci::get(m, "portal_url"))
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
 
     (
         portal::LineCfg {
             name: "cli".into(),
+            portal_url,
             device,
             source,
             username,
@@ -234,6 +248,40 @@ fn cli_login(rest: &[String]) {
         _ => {
             println!("结论: 认证失败 ({})", detail);
             exit(1);
+        }
+    }
+}
+
+/// 只探测门户地址(排查用): 有劫持就用劫持地址, 没有则验证手填的 portal_url; 不登录
+fn cli_detect_portal(rest: &[String]) {
+    let (line, _) = resolve_line(rest);
+    let client = http::HttpClient::new(
+        line.source,
+        line.device.clone(),
+        std::time::Duration::from_secs(timeout_of(rest)),
+    );
+    let log = |s: &str| println!("{s}");
+    println!(
+        "检测门户开始: 设备={} 源IP={} 手填门户={}",
+        line.device.as_deref().unwrap_or("自动"),
+        line.source
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "自动检测".into()),
+        if line.portal_url.trim().is_empty() {
+            "(未填)".to_string()
+        } else {
+            line.portal_url.clone()
+        }
+    );
+    match portal::detect_portal(&client, &line.portal_url, &log) {
+        Some(base) => println!(
+            "发现门户: {base}\n(登录页 GET 正常; 可 uci set portalkeeper.main.portal_url='{base}' 固化)"
+        ),
+        None => {
+            println!("未发现门户: 没有劫持响应, 手填的门户地址也验证不通过(本机可能已在线或不在校园网)");
+            println!("手动获取: 浏览器打开 http://www.msftconnecttest.com/connecttest.txt ,");
+            println!("地址栏跳转后的地址整条填进 LuCI「认证服务 → 门户地址」即可。");
+            exit(2);
         }
     }
 }

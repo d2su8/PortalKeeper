@@ -1,5 +1,17 @@
 # 更新日志
 
+## v1.1.0
+
+**兼容更多使用 zaxsoft(石斧)门户的学校**
+
+- 劫持识别不再认死门户 IP: 302 的目标主机与请求主机不同即判为被劫持(同主机跳转如 baidu→https 仍判无结论),
+  相对路径按当前请求主机补全; 登录页请求跟随跳转(最多 3 跳), POST 打到最终 URL
+- 新增 uci `portalkeeper.main.portal_url`(LuCI「认证服务 → 门户地址」): 探测不到劫持时用它,
+  都没有才报 `no-portal` 并在日志里给出手动获取办法(浏览器打开任意 http 网站 → 复制跳转后的地址)
+- 账号/密码字段名按登录页推断(type=password 与其前一个可见文本输入), 推不出来才回退 userId/passwd
+- 新增 `portalkeeperd detect-portal` 子命令(只探测门户地址, 不登录, 探测不到退出码 2)与 `--portal` 选项
+- 登录探测地址可用环境变量 `CAMPUS_AUTH_PROBE` 覆盖(逗号分隔 host[:port]/path), 与桌面版同名同格式
+
 ## v1.0.0
 
 首个版本 —— OpenWrt / LuCI 校园网门户自动认证插件。
