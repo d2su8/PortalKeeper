@@ -11,6 +11,8 @@ const STATUS_PATH = '/tmp/portalkeeper.status';
 const TRIGGER_PATH = '/tmp/portalkeeper.trigger';
 const LOG_PATH = '/tmp/portalkeeper.log';
 const CLI = '/usr/bin/portalkeeperd';
+// 自助管理后台默认地址(未配置门户地址时用)
+const DEFAULT_SELF_URL = 'http://10.255.2.249/self/';
 const INIT = '/etc/init.d/portalkeeper';
 
 // 常驻 ubus 连接(参照 luci.upnp 注释, 防止调用间被 GC)
@@ -41,10 +43,15 @@ function autostart_enabled() {
 }
 
 function read_status() {
+	const uci = cursor();
+	const portal = uci.get('portalkeeper', 'main', 'portal_url') || '';
+
 	const out = {
 		daemon_running: service_running(),
 		autostart: autostart_enabled(),
 		updated_human: '',
+		// 自助管理后台(新版门户是 /self/ 下的 SPA); 配了门户地址就按它拼
+		self_url: portal != '' ? portal.replace(/\/+$/, '') + '/self/' : DEFAULT_SELF_URL,
 		lines: []
 	};
 

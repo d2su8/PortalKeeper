@@ -11,7 +11,12 @@ var callGetIfaces = rpc.declare({ object: 'portalkeeper', method: 'getifaces', e
 var callGetIfInfo = rpc.declare({ object: 'portalkeeper', method: 'getifinfo', params: [ 'device', 'source' ], expect: {} });
 var callRunCheck = rpc.declare({ object: 'portalkeeper', method: 'runcheck', params: [ 'device', 'source' ], expect: {} });
 
-var SELF_URL = 'http://10.255.2.252/self/index.html#/Login';
+// 自助管理后台地址(新版门户); 页面加载后会用 getstatus 返回的 self_url 覆盖
+var SELF_URL = 'http://10.255.2.249/self/';
+
+// 项目主页与免责声明
+var REPO_URL = 'https://github.com/d2su8/PortalKeeper';
+var DISCLAIMER = '免责声明: 本软件供学习交流使用, 请遵守所在学校/机构的网络使用规定。';
 
 var statusRowEl = null;      // 运行状态行(5 秒轮询重绘)
 var checkDetailEl = null;    // 主线路探测的原始输出(只在测试时重绘, 免得轮询把展开的折叠框收起)
@@ -257,6 +262,10 @@ return view.extend({
 		window.open(SELF_URL, '_blank');
 	},
 
+	handleOpenRepo: function() {
+		window.open(REPO_URL, '_blank');
+	},
+
 	load: function() {
 		return Promise.all([
 			callGetStatus().catch(function() { return null; }),
@@ -274,6 +283,8 @@ return view.extend({
 
 	render: function(data) {
 		lastStatus = data.status;
+		if (data.status && data.status.self_url)
+			SELF_URL = data.status.self_url;
 		lines = data.lines || [];
 		infos = data.infos || [];
 		checks = data.checks || [];
@@ -399,6 +410,18 @@ return view.extend({
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, '线路信息'),
 					(panelsBoxEl = E('div', { 'id': 'portalkeeper-panels' }))
+				]),
+
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, '关于'),
+					hrow([
+						E('button', {
+							'class': 'btn cbi-button cbi-button-action',
+							'click': ui.createHandlerFn(self, 'handleOpenRepo')
+						}, '项目主页(GitHub)'),
+						spacer(),
+						E('span', { 'style': 'color:#666; font-size:12px; flex:1 1 420px' }, DISCLAIMER)
+					])
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [

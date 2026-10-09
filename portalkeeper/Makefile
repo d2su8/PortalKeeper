@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=portalkeeper
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 PKG_MAINTAINER:=PortalKeeper contributors
 PKG_LICENSE:=MIT

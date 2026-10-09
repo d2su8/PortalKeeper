@@ -76,8 +76,8 @@ file target/aarch64-unknown-linux-musl/release/portalkeeperd
 cd ~/portalkeeper/build
 ./build-ipk.sh
 # 产物:
-#   ~/portalkeeper/build/out/portalkeeper_1.0.0-1_aarch64_cortex-a53.ipk
-#   ~/portalkeeper/build/out/luci-app-portalkeeper_1.0.0-1_all.ipk
+#   ~/portalkeeper/build/out/portalkeeper_<版本>-1_aarch64_cortex-a53.ipk
+#   ~/portalkeeper/build/out/luci-app-portalkeeper_<版本>-1_all.ipk
 ```
 
 ## 5. 安装到路由器

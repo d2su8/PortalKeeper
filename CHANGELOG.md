@@ -1,5 +1,19 @@
 # 更新日志
 
+## v1.2.0
+
+**适配 2026-10 校园网门户改版(SPA + 令牌 API)**
+
+- 登录: 登录页没有 password 输入框时判定为新版 SPA 门户, 改走 `POST <门户>/portal/webauth/auth`
+  (表单编码 userId/passwd/loginMode/wlanuserip/wlanacip/wlanacname, 响应 JSON);
+  老板牌表单式门户原逻辑不变(两种门户自动识别, 学校再换回去也不用改代码)
+- 复核放行抽成 `recheck()`, 两种登录路径共用
+- 自助管理链接: 默认 `http://10.255.2.249/self/`; `getstatus` 新增 `self_url`
+  (按 uci `portal_url` 拼 `<基地址>/self/`), LuCI 概览页「打开自助管理后台(下线)」按钮跟随
+- 注意: 新版接口必填 `wlanacip`/`wlanacname`; 设备在线时没有劫持 URL 可取, 所以
+  「门户地址」要么填完整登录页 URL(含 query), 要么在未认证时先认证一次(daemon 从劫持 URL 取值)
+- 验证: 单元测试 9 例通过; 用"假 SPA 门户"(本地模拟新版外壳 + `/portal/webauth/auth`)端到端跑通登录
+
 ## v1.1.0
 
 **兼容更多使用 zaxsoft(石斧)门户的学校**

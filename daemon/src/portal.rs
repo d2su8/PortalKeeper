@@ -20,7 +20,7 @@ use crate::http::HttpClient;
 /// bossWeb 门户地址(贺州学院校园网实测值)
 pub const PORTAL_HOST: &str = "10.255.2.252";
 /// 自助管理后台(下线指引跳转目标)
-pub const SELF_SERVICE_URL: &str = "http://10.255.2.252/self/index.html#/Login";
+pub const SELF_SERVICE_URL: &str = "http://10.255.2.249/self/";
 
 /// 探测地址 (host, path)
 pub const PROBE_URLS: [(&str, &str); 3] = [
@@ -403,6 +403,95 @@ pub fn detect_portal(
     None
 }
 
+/// 新版门户(SPA)登录: POST {base}/portal/webauth/auth (表单编码, 响应 JSON)。
+/// Ok(true)=本机已在线(门户把提示放在 redirect 的 errorMsg 里); Ok(false)=已受理待复核;
+/// Err(code,msg)=失败
+fn login_spa(
+    client: &HttpClient,
+    loc: &str,
+    fields: &[(String, String)],
+    username: &str,
+    password: &str,
+    ua: &str,
+    log: &(dyn Fn(&str) + Sync),
+) -> Result<bool, (&'static str, String)> {
+    let base = url_base(loc);
+    let auth_url = format!("{base}/portal/webauth/auth");
+    let get = |k: &str| -> String {
+        fields
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+            .or_else(|| query_param(loc, k))
+            .unwrap_or_default()
+    };
+    let (ip, acip, acname) = (get("wlanuserip"), get("wlanacip"), get("wlanacname"));
+    let mut pairs: Vec<(String, String)> = vec![
+        ("userId".to_string(), username.to_string()),
+        ("passwd".to_string(), password.to_string()),
+        ("loginMode".to_string(), "password".to_string()),
+        ("wlanuserip".to_string(), ip.clone()),
+        ("wlanacip".to_string(), acip.clone()),
+        ("wlanacname".to_string(), acname.clone()),
+    ];
+    let distoken = get("distoken");
+    if !distoken.is_empty() {
+        pairs.push(("distoken".to_string(), distoken));
+    }
+    let body = pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    (log)(&format!(
+        "  新版门户(SPA): POST {auth_url}  userId={username} passwd=*** loginMode=password wlanuserip={ip} wlanacip={acip} wlanacname={acname}"
+    ));
+    let headers = [
+        ("User-Agent", ua),
+        ("Accept", "application/json, text/plain, */*"),
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Referer", loc),
+        ("Origin", base.as_str()),
+    ];
+    let resp = client
+        .request("POST", &auth_url, &headers, Some(&body))
+        .map_err(|e| ("unreachable", format!("接口请求失败: {e}")))?;
+    let text = crate::portal::decode_body(&resp.body);
+    (log)(&format!(
+        "第 3 步完成: 接口 HTTP {} ({} 字节)",
+        resp.status,
+        resp.body.len()
+    ));
+    let v: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+        (
+            "fail",
+            format!("接口响应不是 JSON({e}): {}", text.chars().take(160).collect::<String>()),
+        )
+    })?;
+    if !v["success"].as_bool().unwrap_or(false) {
+        let msg = v["message"].as_str().unwrap_or("").to_string();
+        (log)(&format!("  门户返回: {msg}"));
+        if msg.contains("密码") {
+            return Err(("badpass", msg));
+        }
+        if CONFLICT_KEYWORDS.iter().any(|k| msg.contains(k)) {
+            return Err(("conflict", msg));
+        }
+        return Err(("fail", msg));
+    }
+    if let Some(r) = v["result"]["redirect"].as_str() {
+        if let Some(e) = query_param(r, "errorMsg") {
+            (log)(&format!("  门户返回消息: {e}"));
+            if e.contains("已在线") {
+                (log)("本机已在线, 无需重复认证");
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// 完整认证流程. 返回 (成功?, code, detail)
 /// code: already / ok / badpass / conflict / unreachable / fail
 pub fn authenticate(
@@ -453,6 +542,17 @@ pub fn authenticate(
             return (false, "unreachable", format!("门户连接失败: {e}"));
         }
     };
+    // 新版门户(SPA: 登录页只是 JS 外壳, 无表单)走接口; 判据 = 页面里有没有 password 输入框
+    let inputs = parse_form_inputs(&page_text);
+    let (uf_opt, pf_opt) = detect_credential_fields(&inputs);
+    if pf_opt.is_none() {
+        let fields = parse_form_fields(&page_text);
+        match login_spa(&client, &loc, &fields, &line.username, &line.password, &ua, log) {
+            Ok(true) => return (true, "already", "已在线".into()),
+            Ok(false) => return recheck(&client, log),
+            Err((code, msg)) => return (false, code, msg),
+        }
+    }
     (log)(&format!(
         "第 2 步完成: 会话 Cookie ({})",
         if cookie.is_empty() { "无" } else { cookie.split('=').next().unwrap_or("?") }
@@ -476,6 +576,7 @@ pub fn authenticate(
         }
     ));
 
+    let (uf, pf) = (uf_opt, pf_opt);
     // ---- 第 3 步: POST 登录(字段名大小写敏感, 以页面原始键名为准) ----
     let mut form_pairs: Vec<(String, String)> = fields.clone();
     for (base_k, dv) in BASE_FORM_DEFAULTS {
@@ -492,7 +593,6 @@ pub fn authenticate(
     }
     // 账号/密码字段名按登录页推断(老板牌是 userId/passwd, 别家门户可能叫 account/pwd),
     // 推不出来才回退固定名 —— 换学校不用改代码
-    let (uf, pf) = detect_credential_fields(&parse_form_inputs(&page_text));
     let user_field = uf.unwrap_or_else(|| "userId".to_string());
     let pass_field = pf.unwrap_or_else(|| "passwd".to_string());
     (log)(&format!("  表单身份字段: 账号={user_field} 密码={pass_field}"));
@@ -553,6 +653,11 @@ pub fn authenticate(
     }
 
     // ---- 第 4 步: 复核放行(唯一可靠判定) ----
+    recheck(&client, log)
+}
+
+/// 复核放行: 等 3 秒再探测, 200/204 无重定向 = 已上线
+fn recheck(client: &HttpClient, log: &(dyn Fn(&str) + Sync)) -> (bool, &'static str, String) {
     for attempt in 1..=2 {
         (log)(&format!("第 4 步: 等待 3 秒后复核放行 (第 {attempt}/2 次)..."));
         thread::sleep(Duration::from_secs(3));
@@ -565,17 +670,13 @@ pub fn authenticate(
             ProbeState::Online => {
                 (log)("复核: 200/204 无重定向 -> 已放行");
                 (log)("=== 认证成功, 已上线! ===");
-                return (true, "ok", errmsg);
+                return (true, "ok", String::new());
             }
             _ => (log)(&format!("复核第 {attempt} 次: 仍未放行, 继续等待...")),
         }
     }
     (log)("=== 认证失败: 复核仍未放行 ===");
-    (
-        false,
-        "fail",
-        if errmsg.is_empty() { "复核未放行".into() } else { errmsg },
-    )
+    (false, "fail", "复核未放行".into())
 }
 
 /// 探测某出口的源 IP: UDP connect 技巧(不发包), 配合 SO_BINDTODEVICE 可取任意网卡的地址
@@ -903,4 +1004,42 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0], ("10.0.0.1".to_string(), "/portal".to_string()));
     }
+}
+
+/// 取 URL query 中某个参数(百分号解码), 相对路径形式 `?a=1&b=2` 也可
+pub fn query_param(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    for kv in q.split('&') {
+        let (k, v) = match kv.split_once('=') {
+            Some(x) => x,
+            None => (kv, ""),
+        };
+        if k == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// 百分号解码(+ 视作空格), 非法序列按原样保留
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }

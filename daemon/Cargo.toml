@@ -1,6 +1,6 @@
 [package]
 name = "portalkeeper"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "PortalKeeper 校园网自动认证守护进程 (OpenWrt)"
 
