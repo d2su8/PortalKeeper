@@ -1,5 +1,18 @@
 # 更新日志
 
+## 未发布
+
+**打包: 支持新版固件的 apk 包**
+
+- 新固件包管理器换成 apk(apk-tools 3, 包格式 APKv3/ADB, 魔数 `ADBd`), ipk 装不上; 新增 `build/build-apk.sh`,
+  用 apk-tools 的 `mkpkg` 生成 `portalkeeper_<版本>-r1.apk` 与 `luci-app-portalkeeper_<版本>-r1.apk`
+  (包内文件属主 root:root, 需以 root 运行; 自带 adbdump 自检)
+- 取工具方式与安装命令见 BUILD.md「4b. 打包 apk」; `build-ipk.sh` 保留给还在用 opkg 的老固件
+- 真机验证: 新固件(ImmortalWRT SNAPSHOT / apk-tools 3.0.5 / 内核 6.18)上
+  `apk add --allow-untrusted` 安装成功、uci-defaults 与开机链接正常、ubus 对象注册、
+  守护进程启动即完成新版门户认证(SPA 接口)、踢掉会话后自动重连成功;
+  另记两个坑: 包内文件必须 root:root 且不可对外可写(否则 rpcd 静默拒绝加载 ucode 插件)
+
 ## v1.2.0
 
 **适配 2026-10 校园网门户改版(SPA + 令牌 API)**

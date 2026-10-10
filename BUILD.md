@@ -80,6 +80,44 @@ cd ~/portalkeeper/build
 #   ~/portalkeeper/build/out/luci-app-portalkeeper_<版本>-1_all.ipk
 ```
 
+## 4b. 打包 apk(新版固件: 包管理器已是 apk)
+
+2026-10 之后刷的新固件把包管理器换成了 **apk**(apk-tools 3.x, 包格式 APKv3/ADB, 文件头魔数 `ADBd`),
+老的 `.ipk` 装不上去了。改用 `build/build-apk.sh`(它调用 apk-tools 的 `mkpkg` 子命令):
+
+```bash
+# ① 一次性: 取 apk-tools v3 静态工具(任意 x86_64 Linux 都能跑, 不需要装依赖)
+mkdir -p ~/apktool && cd ~/apktool
+curl -L -o apk-tools-static.apk   https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/apk-tools-static-3.0.8-r0.apk
+tar xzf apk-tools-static.apk sbin/apk.static && chmod +x sbin/apk.static
+
+# ② 打包(必须 root: 包内文件属主需要是 root:root; WSL 用 -u root 免密)
+wsl -d Ubuntu -u root
+cd /home/<你>/portalkeeper/build
+APK=$HOME/apktool/apk.static bash build-apk.sh
+# 产物: out-apk/portalkeeper_<版本>-r1.apk
+#       out-apk/luci-app-portalkeeper_<版本>-r1.apk
+```
+
+安装(本地包没签名, 必须带 `--allow-untrusted`):
+
+```sh
+apk update                       # 先刷索引, 否则依赖解析可能失败
+apk add --allow-untrusted /tmp/portalkeeper_*.apk /tmp/luci-app-portalkeeper_*.apk
+apk list | grep portalkeeper     # 核对
+apk del luci-app-portalkeeper portalkeeper   # 卸载(配置保留)
+```
+
+> **两个坑(实测踩过)**:
+> 1. 包内文件必须是 **root:root** 且**不能对外可写** —— 否则 rpcd 会静默拒绝加载 ucode 插件,
+>    `ubus call portalkeeper getstatus` 报 `Not found`(实测 `nobody:nogroup 0777` 就不加载)。
+>    `build-apk.sh` 里已用 `fix_ownership()` 统一归一化, 手工打包时别漏。
+> 2. 设备端 `apk --print-arch` 显示 `aarch64`, 但包标签用的是 `aarch64_cortex-a53`(与固件自带包一致),
+>    两者兼容, 不必改。
+
+> `build-ipk.sh` 仍然保留, 给还在用 opkg 的老固件用。两者产物互不通用:
+> ipk 是 gzip tar(control/data), apk 是 APKv3(ADB 容器)。
+
 ## 5. 安装到路由器
 
 ```bash

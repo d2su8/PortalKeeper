@@ -18,10 +18,14 @@
 ## 安装
 
 ```sh
-scp portalkeeper_*.ipk luci-app-portalkeeper_*.ipk root@<路由器IP>:/tmp/
+scp portalkeeper_*.apk luci-app-portalkeeper_*.apk root@<路由器IP>:/tmp/
 ssh root@<路由器IP>
-opkg install /tmp/portalkeeper_*.ipk /tmp/luci-app-portalkeeper_*.ipk
+apk update                        # 新版固件(包管理器 apk)
+apk add --allow-untrusted /tmp/portalkeeper_*.apk /tmp/luci-app-portalkeeper_*.apk
 ```
+
+老固件(opkg)用 `.ipk`:`opkg install /tmp/portalkeeper_*.ipk /tmp/luci-app-portalkeeper_*.ipk`
+—— 两种包由 `build/build-apk.sh` 与 `build/build-ipk.sh` 分别生成, 互不通用。
 
 然后打开 LuCI → **服务 → PortalKeeper** → 填账号密码 → 勾选「启用」→ 点页面底部「保存并应用」。
 

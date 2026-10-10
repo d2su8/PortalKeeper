@@ -1,6 +1,7 @@
 # 构建产物
 daemon/target/
 build/out/
+build/out-apk/
 
 # 打包时放进包目录的二进制(由 build-ipk.sh 生成, 不入库)
 portalkeeper/files/usr/bin/portalkeeperd
