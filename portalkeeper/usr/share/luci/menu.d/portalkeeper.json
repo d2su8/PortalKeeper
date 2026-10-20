@@ -1,0 +1,8 @@
+{
+	"admin/services/portalkeeper": {
+		"title": "PortalKeeper",
+		"order": 65,
+		"action": { "type": "view", "path": "portalkeeper/overview" },
+		"depends": { "acl": [ "portalkeeper" ] }
+	}
+}

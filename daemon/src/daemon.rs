@@ -30,7 +30,7 @@ const TICK_SECS: u64 = 1;
 static STOP_SIG: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_stop_signal(sig: libc::c_int) {
-    STOP_SIG.store(sig as i32, Ordering::SeqCst);
+    STOP_SIG.store(sig, Ordering::SeqCst);
 }
 
 /// 捕获 SIGTERM/SIGINT(procd 停止或重启服务、Ctrl+C)。
@@ -118,6 +118,11 @@ struct LineRun {
     detail: String,
     fail_count: u32,
     exhausted: bool,
+    // 运行统计(本次守护进程存活期间, LuCI 状态卡展示; 重启服务清零)
+    offline_count: u32,
+    auth_ok: u32,
+    auth_fail: u32,
+    last_fail: String,
 }
 
 pub fn run(rest: &[String]) {
@@ -176,6 +181,10 @@ pub fn run(rest: &[String]) {
         detail: "尚未检测".into(),
         fail_count: 0,
         exhausted: false,
+        offline_count: 0,
+        auth_ok: 0,
+        auth_fail: 0,
+        last_fail: String::new(),
     }];
     // 源 IP: 显式配置优先, 否则按网卡自动探测
     if let Some(src) = main
@@ -226,6 +235,10 @@ pub fn run(rest: &[String]) {
                 detail: "尚未检测".into(),
                 fail_count: 0,
                 exhausted: false,
+                offline_count: 0,
+                auth_ok: 0,
+                auth_fail: 0,
+                last_fail: String::new(),
             });
         }
     }
@@ -258,7 +271,7 @@ pub fn run(rest: &[String]) {
         if auto_retry { "开" } else { "关" },
         retry_interval,
         retry_count,
-        if portal::parse_probe_url(&probe_url).is_some() {
+        if portal::has_custom_probe(&probe_url) {
             format!(", 自定义探测网站={}", probe_url.trim())
         } else {
             String::new()
@@ -332,7 +345,8 @@ fn monitor_all(lines: &mut [LineRun], retry_count: u32, probe_url: &str) {
         }
         monitor(lr, retry_count, probe_url);
     }
-    write_status(lines, true, 0, retry_count);
+    // 注意: 这里不写状态文件 —— 三个调用点(run 启动/手动触发/周期检测)
+    // 都会在返回后立即用真实参数 write_status, 由它们统一写
 }
 
 /// 一轮监测: 探测 → 在线则不动(无保活发包) → 掉线则按重试策略认证
@@ -346,11 +360,7 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
         lr.detail = "未配置账号密码".into();
         return;
     }
-    let client = crate::http::HttpClient::new(
-        lr.source,
-        lr.device.clone(),
-        Duration::from_secs(5),
-    );
+    let client = crate::http::HttpClient::new(lr.source, lr.device.clone(), Duration::from_secs(5));
     let (verdict, det) = portal::connectivity_test(&client, probe_url);
     match verdict {
         Some(true) => {
@@ -365,8 +375,7 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
         Some(false) => {
             if lr.exhausted {
                 lr.state = "exhausted".into();
-                lr.detail =
-                    "自动重试次数已用完: 请排查后点「立即检测并认证」或重启服务重置".into();
+                lr.detail = "自动重试次数已用完: 请排查后到顶部状态卡点「重启服务」重置".into();
                 logging::log(&format!("[{}] 处于暂停重试状态, 跳过本轮", lr.role));
                 return;
             }
@@ -374,7 +383,11 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
             if stop_pending() {
                 return;
             }
-            logging::log(&format!("[{}] 检测到掉线(被门户劫持), 开始认证...", lr.role));
+            logging::log(&format!(
+                "[{}] 检测到掉线(被门户劫持), 开始认证...",
+                lr.role
+            ));
+            lr.offline_count += 1;
             let line = LineCfg {
                 name: lr.name.clone(),
                 portal_url: lr.portal_url.clone(),
@@ -395,8 +408,11 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
                 };
                 lr.fail_count = 0;
                 lr.exhausted = false;
+                lr.auth_ok += 1;
             } else {
                 lr.fail_count += 1;
+                lr.auth_fail += 1;
+                lr.last_fail = format!("{}: {}", code, detail);
                 if lr.fail_count >= retry_count {
                     lr.exhausted = true;
                     lr.state = "exhausted".into();
@@ -443,6 +459,10 @@ fn write_status(lines: &[LineRun], auto_retry: bool, retry_interval: u64, retry_
                 "ua": l.ua,
                 "state": l.state,
                 "detail": l.detail,
+                "offline_count": l.offline_count,
+                "auth_ok": l.auth_ok,
+                "auth_fail": l.auth_fail,
+                "last_fail": l.last_fail,
             })
         })
         .collect();

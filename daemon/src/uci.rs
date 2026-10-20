@@ -57,7 +57,11 @@ impl Config {
                     if let Some(sec) = cur.take() {
                         cfg.sections.push(sec);
                     }
-                    let stype = it.next().unwrap_or("").trim_matches(['\'', '"']).to_string();
+                    let stype = it
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(['\'', '"'])
+                        .to_string();
                     let name = it.next().map(|s| s.trim_matches(['\'', '"']).to_string());
                     cur = Some(Section {
                         stype,
@@ -67,7 +71,11 @@ impl Config {
                 }
                 "option" | "list" => {
                     // option <k> <v>  (list 取最后一条, 本插件无多值需求)
-                    let k = it.next().unwrap_or("").trim_matches(['\'', '"']).to_string();
+                    let k = it
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(['\'', '"'])
+                        .to_string();
                     let rest = line.splitn(3, char::is_whitespace).nth(2).unwrap_or("");
                     let v = unquote(rest);
                     if let Some(sec) = cur.as_mut() {

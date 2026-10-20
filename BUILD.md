@@ -8,7 +8,7 @@
 > 不要直接在 `/mnt/d/...` 下跑 cargo —— /mnt 走 9p 文件协议, cargo 的上万个小文件会慢 5~10 倍。
 > 下文用 `<仓库>` 表示本仓库在你机器上的位置; 命令里的 `192.168.5.1` 是本机路由器的管理地址, 按自己的改。
 >
-> 产物: `portalkeeper_*.ipk`(核心守护, 静态编译) + `luci-app-portalkeeper_*.ipk`(Web 管理界面)
+> 产物: `portalkeeper_*.ipk`(守护进程 + LuCI 界面**单包**, 静态编译; 不再拆分 luci-app)
 > 原则: 日志只写 /tmp(tmpfs), 不落闪存避免 NAND 磨损; Rust 静态链接, 无任何 .so 依赖
 
 ---
@@ -75,9 +75,8 @@ file target/aarch64-unknown-linux-musl/release/portalkeeperd
 ```bash
 cd ~/portalkeeper/build
 ./build-ipk.sh
-# 产物:
+# 产物(单包, 守护进程 + LuCI 界面一体):
 #   ~/portalkeeper/build/out/portalkeeper_<版本>-1_aarch64_cortex-a53.ipk
-#   ~/portalkeeper/build/out/luci-app-portalkeeper_<版本>-1_all.ipk
 ```
 
 ## 4b. 打包 apk(新版固件: 包管理器已是 apk)
@@ -95,17 +94,16 @@ tar xzf apk-tools-static.apk sbin/apk.static && chmod +x sbin/apk.static
 wsl -d Ubuntu -u root
 cd /home/<你>/portalkeeper/build
 APK=$HOME/apktool/apk.static bash build-apk.sh
-# 产物: out-apk/portalkeeper_<版本>-r1.apk
-#       out-apk/luci-app-portalkeeper_<版本>-r1.apk
+# 产物(单包): out-apk/portalkeeper_<版本>-r1_<架构>.apk
 ```
 
 安装(本地包没签名, 必须带 `--allow-untrusted`):
 
 ```sh
 apk update                       # 先刷索引, 否则依赖解析可能失败
-apk add --allow-untrusted /tmp/portalkeeper_*.apk /tmp/luci-app-portalkeeper_*.apk
+apk add --allow-untrusted /tmp/portalkeeper_*.apk
 apk list | grep portalkeeper     # 核对
-apk del luci-app-portalkeeper portalkeeper   # 卸载(配置保留)
+apk del portalkeeper             # 卸载(配置保留)
 ```
 
 > **两个坑(实测踩过)**:
@@ -123,10 +121,10 @@ apk del luci-app-portalkeeper portalkeeper   # 卸载(配置保留)
 ```bash
 scp ~/portalkeeper/build/out/*.ipk root@192.168.5.1:/tmp/
 ssh root@192.168.5.1
-opkg install /tmp/portalkeeper_*.ipk /tmp/luci-app-portalkeeper_*.ipk
+opkg install /tmp/portalkeeper_*.ipk
 ```
 
-> 不想用界面的话可以不装 `luci-app-portalkeeper`: 核心包自带 init 脚本 + UCI 配置, 设好
+> 单包自带 init 脚本 + UCI 配置 + LuCI 界面。即使不想用界面, 也可以纯命令行: 设好
 > `portalkeeper.main.username` / `password` 与 `enabled='1'` 后 `uci commit` +
 > `/etc/init.d/portalkeeper start` 即可(详见 README「不用 LuCI，纯命令行怎么跑」)。
 > 参数不全时服务不会启动, 原因写在 `/tmp/portalkeeper.log`。
@@ -134,7 +132,7 @@ opkg install /tmp/portalkeeper_*.ipk /tmp/luci-app-portalkeeper_*.ipk
 浏览器打开 `http://192.168.5.1/cgi-bin/luci/` → **服务 → PortalKeeper**:
 
 1. **概览 → 运行状态**: 看服务是否「运行中」、网络是否正常(打开页面会自动逐条线路做一次联通测试, 也可点标题行右侧「联通测试」重测)
-2. **概览 → 认证服务**: 填账号密码, 选 WAN 口(或留空自动检测), 选设备认证类型, 需要的话填「自定义探测网站」, 勾选「启用 PortalKeeper 服务」→ 点页面底部「保存并应用」启动
+2. **概览 → 认证服务**: 填账号密码, 选 WAN 口(或留空自动检测), 选设备认证类型, 需要的话填「自定义探测网站」(可填多个, 逗号分隔), 勾选「启用」并「保存并应用」; 改完配置也可以直接点状态卡「启用」下方的「重启服务」立即生效
 3. **概览 → 线路信息**: 核对每条线路的网卡/IP/MAC 与各自联网状态(开了多线多拨时线路一/线路二左右并排)
 4. **日志**: 查看服务启停记录与每次探测/认证的详细过程
 
@@ -146,6 +144,30 @@ cp -r "<仓库>/daemon/src" ~/portalkeeper/daemon/
 cd ~/portalkeeper/daemon
 cargo build --release --target aarch64-unknown-linux-musl
 cd ../build && ./build-ipk.sh && scp out/*.ipk root@192.168.5.1:/tmp/
+```
+
+> 迭代提醒: apk 对同版本号(如 `1.3.0-r1`)不重装, 代码变了要递增 release 号
+> (`REL=2 bash build-apk.sh`); 若曾把本地 apk 路径装进 `/etc/apk/world`,
+> 删文件后再装会报 `unable to select packages`, 用 `apk del '/tmp/xxx.apk'` 清条目。
+
+---
+
+## 7. CI 自动构建(GitHub Actions)
+
+仓库自带 `.github/workflows/build.yml`, 推送/PR/打 tag 都会触发:
+
+- **test job**: 宿主机 target 跑 `cargo test` + `clippy -D warnings` + `fmt --check`,
+  并校验 `daemon/Cargo.toml` 与 `portalkeeper/Makefile` 的版本号一致(构建 job 依赖它, 不过不许打包)
+- **build job**: 4 架构矩阵交叉编译(aarch64/armv7/x86_64/mipsel, musl 静态) +
+  ipk/apk 打包, 产物传 artifact; 交叉编译跑在 rust-cross 的 Docker 镜像里
+  (工具链 + 各 target 的 Rust std 都在镜像内, 不依赖 musl.cc 下载)
+- **release job**: 仅 `v*` tag 触发, 汇总全部架构产物发布到 GitHub Release
+
+本地不想装工具链时, 可在 GitHub 仓库页面 **Actions → Build → Run workflow** 手动触发,
+从 artifact 下载对应架构的包。tag 发布(版本号与 Cargo.toml 一致):
+
+```bash
+git tag v1.3.0 && git push origin v1.3.0
 ```
 
 ---
@@ -160,9 +182,8 @@ Rust 交叉编译仍建议按路径 A 完成:
 ./scripts/feeds update -a
 ./scripts/feeds install -a luci-base
 
-# 2. 链接两个包目录
+# 2. 链接包目录(单包, 守护进程 + LuCI 界面一体)
 ln -s <仓库>/portalkeeper package/portalkeeper
-ln -s <仓库>/luci-app-portalkeeper package/luci-app-portalkeeper
 
 # 3. 先按路径 A 编译好 portalkeeper, 放进包的 files 下
 cp ~/portalkeeper/daemon/target/aarch64-unknown-linux-musl/release/portalkeeperd \
@@ -171,7 +192,6 @@ cp ~/portalkeeper/daemon/target/aarch64-unknown-linux-musl/release/portalkeeperd
 # 4. 编译
 make defconfig
 make package/portalkeeper/compile V=s
-make package/luci-app-portalkeeper/compile V=s
 # 产物在 bin/packages/aarch64_cortex-a53/
 ```
 
@@ -192,13 +212,12 @@ make package/luci-app-portalkeeper/compile V=s
 | 概览显示「未运行」但服务已启动 | 刷新页面(运行状态按 `pidof portalkeeperd` 实时查询) |
 | 联通测试「无法判定」 | 该线路未接校园网口, 或 WAN 口/源 IP 配置错误 |
 | 状态显示「no-credentials」 | 概览页「认证服务」里未填账号密码 |
-| 状态显示「exhausted」 | 连续认证失败已达次数上限被暂停; 排查后点「保存并应用」重启服务重置 |
+| 状态显示「exhausted」 | 连续认证失败已达次数上限被暂停; 排查后点状态卡「重启服务」重置 |
 | 认证频繁失败提示限流 | 门户限流: 把「重试认证间隔」调大到 ≥60 秒再试 |
 
 ## 卸载
 
 ```sh
-opkg remove luci-app-portalkeeper
 opkg remove portalkeeper
 # 配置 /etc/config/portalkeeper 会保留, 手动删除即可
 ```

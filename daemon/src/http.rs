@@ -1,12 +1,20 @@
 //! 极简 HTTP/1.1 客户端(门户为明文 HTTP, 无需 TLS):
 //! - 支持绑定源 IP 与出口网卡(Linux SO_BINDTODEVICE, 多线多拨的关键)
 //! - 支持 chunked 解码; UA 头只出现一次(门户按首个 UA 判定设备槽位)
+//! - 响应体大小有上限(1MB): 门户登录页/接口响应实际只有几十 KB,
+//!   异常或恶意响应无限增长会吃满路由器内存(常见 128MB), 超限即截断
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+/// 响应体上限: 超过即停止读取(截断)。1MB 对门户流程绰绰有余
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// 头部(状态行+头字段)查找范围: 正常响应头部几百字节, 64KB 足够,
+/// 避免对整包 raw(含大 body)做分隔符扫描
+const HEAD_SEARCH_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct HttpResponse {
@@ -93,7 +101,8 @@ impl HttpClient {
         } else {
             format!("{host}:{port}")
         };
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n");
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n");
         let mut has_ua = false;
         for (k, v) in headers {
             if k.eq_ignore_ascii_case("user-agent") {
@@ -118,6 +127,10 @@ impl HttpClient {
         let mut raw = Vec::with_capacity(16 * 1024);
         let mut chunk = [0u8; 8192];
         loop {
+            if raw.len() >= MAX_BODY_BYTES {
+                // 超限截断: 门户正常响应远小于此; 防异常响应撑爆路由器内存
+                break;
+            }
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => raw.extend_from_slice(&chunk[..n]),
@@ -136,7 +149,10 @@ impl HttpClient {
 }
 
 fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
-    let sep = raw
+    // 只在前 64KB 内找头部分隔符(正常响应头部几百字节; 找不到即视为坏响应,
+    // 没必要把含大 body 的整包再扫一遍)
+    let head_limit = raw.len().min(HEAD_SEARCH_LIMIT);
+    let sep = raw[..head_limit]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "响应缺少头部分隔符".to_string())?;
@@ -174,11 +190,11 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
 fn decode_chunked(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0usize;
-    loop {
-        let line_end = match data[i..].windows(2).position(|w| w == b"\r\n") {
-            Some(p) => i + p,
-            None => break,
-        };
+    while let Some(line_end) = data[i..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| i + p)
+    {
         let size_str = String::from_utf8_lossy(&data[i..line_end]);
         let size_str = size_str.split(';').next().unwrap_or("").trim();
         let size = match usize::from_str_radix(size_str, 16) {

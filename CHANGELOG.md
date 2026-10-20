@@ -1,17 +1,36 @@
 # 更新日志
 
-## 未发布
+## v1.3.0
+
+**界面重构 + 单包整合**
+
+- UI 重构: 三个页面合并为「单页 + 顶部状态卡 + 四个标签页」(概览/认证设置/高级设置/日志);
+  硬编码色值改用 LuCI 主题语义类(修复暗色主题白块、运行状态无颜色等问题);
+  字段级联显示(勾选「掉线自动重试」才显示间隔/次数, 勾选「启用扩展线路」才显示第二线路参数)
+- 单包整合: 删除独立的 `luci-app-portalkeeper` 包, 守护进程 + init 脚本 + UCI 配置 + LuCI 界面
+  全部并入一个 `portalkeeper` 包; 主包声明 `Provides/Conflicts/Replaces: luci-app-portalkeeper` 平滑迁移旧安装
+
+**状态卡 + 功能增强**
+
+- 状态卡: 「启用」开关上移到顶部状态卡(即时生效, 写 uci + 启停服务, 不依赖「保存并应用」);
+  新增「重启服务」按钮(等价 `/etc/init.d/portalkeeper restart`), 改完账号/网卡/门户地址后即时生效
+- 运行统计: 记录每次运行的「掉线次数 / 重连成功 / 失败 / 最近失败原因」, 状态卡展示
+- 强制下线: 新增 `portalkeeperd offline` 子命令 + LuCI「强制下线本机」按钮, 新版门户令牌 API
+  全自动(拿令牌→查在线列表找本机→forceOffline); 认证成功时把门户基地址与网关参数持久化到 uci,
+  解决重启后无劫持响应可取网关参数的问题; 旧版门户(表单式)提示走自助后台
+- 自定义探测网站支持逗号分隔多个地址(任一可达即算联网)
 
 **打包: 支持新版固件的 apk 包**
 
-- 新固件包管理器换成 apk(apk-tools 3, 包格式 APKv3/ADB, 魔数 `ADBd`), ipk 装不上; 新增 `build/build-apk.sh`,
-  用 apk-tools 的 `mkpkg` 生成 `portalkeeper_<版本>-r1.apk` 与 `luci-app-portalkeeper_<版本>-r1.apk`
-  (包内文件属主 root:root, 需以 root 运行; 自带 adbdump 自检)
-- 取工具方式与安装命令见 BUILD.md「4b. 打包 apk」; `build-ipk.sh` 保留给还在用 opkg 的老固件
-- 真机验证: 新固件(ImmortalWRT SNAPSHOT / apk-tools 3.0.5 / 内核 6.18)上
-  `apk add --allow-untrusted` 安装成功、uci-defaults 与开机链接正常、ubus 对象注册、
-  守护进程启动即完成新版门户认证(SPA 接口)、踢掉会话后自动重连成功;
-  另记两个坑: 包内文件必须 root:root 且不可对外可写(否则 rpcd 静默拒绝加载 ucode 插件)
+- 新固件(OpenWrt 25.12 / ImmortalWRT)包管理器换成 apk-tools 3(包格式 APKv3/ADB), ipk 装不上;
+  新增 `build/build-apk.sh`, 生成 `portalkeeper_<版本>-r<N>_<架构>.apk`;
+  `build-ipk.sh` 保留给还在用 opkg 的老固件
+
+**自动构建(GitHub Actions)**
+
+- 新增 `.github/workflows/build.yml`: 多架构矩阵交叉编译(aarch64/armv7/x86_64/mipsel 的 musl
+  静态二进制) + 打包 ipk 与 apk + 上传 artifact; 打 tag(`v*`)时自动发布 GitHub Release;
+  test job(cargo test / clippy / fmt)先行把关, 并校验版本号一致
 
 ## v1.2.0
 

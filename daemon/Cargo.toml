@@ -1,6 +1,6 @@
 [package]
 name = "portalkeeper"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "PortalKeeper 校园网自动认证守护进程 (OpenWrt)"
 
@@ -22,7 +22,10 @@ libc = "0.2"
 
 [profile.release]
 opt-level = "s"
-lto = true
+# 不能设 lto = true: rust-cross 的 mipsel 镜像 sysroot 是自建的, std 没嵌 bitcode,
+# fat LTO 会报 "failed to get bitcode from object file for LTO (Can't find section .llvmbc)";
+# 官方 rustup 分发的 rust-std 才带 bitcode, 所以只有 mipsel 暴露此问题(体积差约 10%, 可接受)。
+# panic 同理不能设 "abort"(见下), 自建 sysroot 只带默认 unwind 策略的 std。
+lto = false
 strip = true
-panic = "abort"
 codegen-units = 1

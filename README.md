@@ -1,101 +1,97 @@
 # PortalKeeper
 
-本项目为https://github.com/d2su8/HZXYNET-AutoLogin 认证项目的延伸至OpenWrt 路由器上的校园网认证插件
+[![CI](https://github.com/d2su8/PortalKeeper/actions/workflows/build.yml/badge.svg)](https://github.com/d2su8/PortalKeeper/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/d2su8/PortalKeeper)](https://github.com/d2su8/PortalKeeper/releases)
+[![License: MIT](https://img.shields.io/github/license/d2su8/PortalKeeper)](LICENSE)
+[![Downloads](https://img.shields.io/github/downloads/d2su8/PortalKeeper/total)](https://github.com/d2su8/PortalKeeper/releases)
 
-认证协议按 bossWeb / zaxsoft（石斧软件）门户实测（**2026-10 门户改版已适配**：新版为 SPA + `/portal/webauth/auth` 接口，程序自动识别新版/旧版两种门户）：未认证时网关 302 劫持任意 HTTP → 取会话参数 →
-提交表单 → 复核放行；判定只看响应头，不解析中文文案。
+OpenWrt 上的 zaxsoft（石斧软件）portal 校园网认证小工具。开机自动认证、掉线自动重连，新版 SPA 与旧版表单门户自动识别。
 
-- Rust 静态单二进制 `portalkeeperd` + LuCI 中文界面，opkg 安装，无运行库依赖
+- Rust 静态单二进制 + LuCI 界面，单包安装，无运行库依赖
 - 开机自动认证，掉线自动重连；在线期间不发多余流量
-- 逐线路联通测试（可自定义探测网站）、多线多拨（默认关闭）、电脑端/手机端槽位选择（门户按认证时的 User-Agent 分槽位，新版门户实测依然如此）
-- 日志只写 `/tmp`（tmpfs），不写闪存；记录服务启停与每次认证过程
+- 逐线路联通测试、多线多拨（默认关闭）、电脑/手机槽位选择
+- 日志只写 `/tmp`（tmpfs），不磨损闪存
 
-## 插件截图
-<img width="1901" height="913" alt="屏幕截图 2026-09-17 191621" src="https://github.com/user-attachments/assets/54e79d9e-b1a6-47af-ad52-aab24308f038" />
-<img width="1896" height="915" alt="屏幕截图 2026-09-17 191629" src="https://github.com/user-attachments/assets/ec141332-8270-4d9a-9968-3873a1ea8703" />
+<details>
+<summary><b>English</b> — OpenWrt campus network auto-login (captive portal) plugin</summary>
 
+**PortalKeeper** is an OpenWrt / LuCI plugin for automatic campus network (captive portal)
+authentication, built as a single static Rust binary.
+
+- Auto-login on boot, auto-reconnect on disconnect; no extra traffic while online
+- Supports both new SPA token-based portals (e.g. zaxsoft) and legacy form-based portals
+- Per-line connectivity test, multi-WAN multi-dial (off by default), device slot selection
+- Logs to tmpfs only — no flash wear
+- Single-package install (`.apk` / `.ipk`) for aarch64 / armv7 / x86_64 / mipsel
+
+</details>
 
 ## 安装
 
-```sh
-scp portalkeeper_*.apk luci-app-portalkeeper_*.apk root@<路由器IP>:/tmp/
-ssh root@<路由器IP>
-apk update                        # 新版固件(包管理器 apk)
-apk add --allow-untrusted /tmp/portalkeeper_*.apk /tmp/luci-app-portalkeeper_*.apk
+### 使用预编译包
+
+1. 前往 [Releases 页面](https://github.com/d2su8/PortalKeeper/releases)。
+2. 根据路由器架构下载对应的 `.apk`（新版固件，apk-tools）或 `.ipk`（老固件，opkg）包：
+
+   | 包名中的架构 | 适用设备 |
+   |---|---|
+   | `aarch64_cortex-a53` | 主流新路由器（MediaTek mt798x 等 ARMv8 机型） |
+   | `arm_cortex-a7` | ARMv7 老机型 |
+   | `x86_64` | x86 软路由 |
+   | `mipsel_24kc` | 老 MIPS 路由器 |
+
+   不确定架构时，在路由器上执行 `ubus call system board`，看返回里的 `release.target`（apk 固件）；老固件用 `opkg print-architecture`。
+3. 上传到路由器后安装：
+
+   ```sh
+   # 新版固件(apk)
+   apk add --allow-untrusted /tmp/portalkeeper_*.apk
+   # 老固件(opkg)
+   opkg install /tmp/portalkeeper_*.ipk
+   ```
+
+   卸载：
+
+   ```sh
+   apk del portalkeeper      # 新版固件
+   opkg remove portalkeeper  # 老固件(配置 /etc/config/portalkeeper 会保留, 需手动删除)
+   ```
+
+打开 LuCI → **服务 → PortalKeeper** → 填账号密码 → 勾选「启用」。
+
+账号密码明文存于 `/etc/config/portalkeeper`，请勿外传配置文件。
+
+## 仓库结构
+
+```text
+PortalKeeper/
+├── daemon/                  # Rust 守护进程(认证引擎, 静态单二进制)
+│   ├── src/
+│   │   ├── main.rs          #   CLI 入口: daemon/check/login/offline/status/detect-portal
+│   │   ├── daemon.rs        #   守护循环: 周期探测/掉线重连/重试策略/状态文件
+│   │   ├── portal.rs        #   门户协议: 302 劫持识别、SPA 令牌登录、强制下线
+│   │   ├── http.rs          #   极简 HTTP 客户端: 绑定源 IP/出口网卡(多线多拨)
+│   │   ├── uci.rs           #   UCI 配置解析
+│   │   └── logging.rs       #   日志(只写 /tmp, 超限滚动裁剪)
+│   └── .cargo/config.toml   #   4 架构 musl 静态链接配置
+├── portalkeeper/            # OpenWrt 单包(守护进程 + LuCI 界面一体)
+│   ├── Makefile             #   OpenWrt SDK 打包定义
+│   ├── files/               #   procd init 脚本 + UCI 默认配置
+│   ├── htdocs/              #   LuCI 视图(打包时映射到 /www/luci-static)
+│   └── usr/                 #   菜单、rpcd ACL、ucode 后端(ubus 对象)
+├── build/                   # 免 SDK 打包脚本(build-ipk.sh / build-apk.sh)
+├── .github/workflows/       # CI: 多架构交叉编译 + 打包, tag 自动发 Release
+├── BUILD.md                 # 编译/打包/安装详细指南(WSL)
+├── CHANGELOG.md
+└── README.md
 ```
-
-老固件(opkg)用 `.ipk`:`opkg install /tmp/portalkeeper_*.ipk /tmp/luci-app-portalkeeper_*.ipk`
-—— 两种包由 `build/build-apk.sh` 与 `build/build-ipk.sh` 分别生成, 互不通用。
-
-然后打开 LuCI → **服务 → PortalKeeper** → 填账号密码 → 勾选「启用」→ 点页面底部「保存并应用」。
-
-- 账号密码以明文保存在路由器 `/etc/config/portalkeeper`，请勿把配置文件或其备份外传。
-- 卸载：`opkg remove luci-app-portalkeeper portalkeeper`；配置需另行删除 `/etc/config/portalkeeper`。
-
-### 不用 LuCI 也能跑
-
-界面包 `luci-app-portalkeeper` 是可选的，核心包自带 init 脚本与 UCI 配置：
-
-```sh
-uci set portalkeeper.main.username='账号'
-uci set portalkeeper.main.password='密码'
-uci set portalkeeper.main.enabled='1'
-uci commit portalkeeper
-/etc/init.d/portalkeeper enable          # 开机自启
-/etc/init.d/portalkeeper start
-```
-
-必需参数只有账号和密码；网卡留空自动检测，重试间隔/次数、探测网站留空就用默认值。
-缺必需参数时服务不会启动，缺什么会写进 `/tmp/portalkeeper.log`。
-
-命令行工具：`portalkeeperd check`（只探测不登录）、`login`（认证一次）、`status`（看线路状态）、
-`daemon`（前台跑，调试用）。
-
-## 页面
-
-| 页面 | 内容 |
-|---|---|
-| 概览 | 运行状态（含逐线路联通测试）、认证服务（账号 / WAN 口 / 槽位 / 掉线自动重试 / 自定义探测网站 / 门户地址）、线路信息、下线指引 |
-| 高级设置 | 第二线路（多线多拨，默认关闭） |
-| 日志 | 查看 / 刷新 / 清空 |
-
-## 换学校 / 换门户
-
-门户地址不写死：未认证时网关会 302 劫持任意 HTTP，程序直接跟着跳转地址走，
-表单字段与账号/密码字段名也从登录页现解析，所以换到别的同类门户（web 门户 + 表单提交）通常不用改任何东西。
-
-探测不到劫持时（该校 AC 不用 302 劫持、或路由器不在校园网），日志会提示手填「门户地址」：
-浏览器打开任意 http 网站（如 `http://www.msftconnecttest.com/connecttest.txt`）→ 把地址栏跳转后的地址
-整条复制 → 填进 LuCI「概览 → 认证服务 → 门户地址」保存并应用（或 `uci set portalkeeper.main.portal_url='地址'`）。
-
-排查用：`portalkeeperd detect-portal`（只探测门户地址，不登录），`--portal '地址'` 可临时指定。
-
-## 实测环境
-
-CMCC RAX3000M（NAND）/ MediaTek mt798x / QWRT R26.9.18（LuCI openwrt-25.12 代）/ 内核 6.6.129 / opkg。
-门户是贺州学院校园网的 bossWeb（zaxsoft 石斧）。
 
 ## 编译
 
-见 [BUILD.md](BUILD.md)：WSL Ubuntu 里
-`cargo build --release --target aarch64-unknown-linux-musl`，再用 `build/build-ipk.sh` 打成两个 ipk。
-
-
-## 相关项目
-
-同属「校园网 + OpenWrt」场景，常与本插件一起使用：
-
-- [UA3F](https://github.com/SunBK201/UA3F) —— HTTP(S) 重写代理，以 HTTP / SOCKS5 / TPROXY / REDIRECT / NFQUEUE 等服务方式透明重写 HTTP(S) 流量（如 User-Agent）
-- [UA2F](https://github.com/Zxilly/UA2F) —— 在 OpenWrt 路由器上把 User-Agent 改成固定字符串，避免被网关检测
-
-分工上互不冲突，可以同时装：UA3F / UA2F 处理「网关看到几台设备」，PortalKeeper 处理「这条线路怎么认证上线」。
+见 [BUILD.md](BUILD.md)。
 
 ## 免责声明
-  
+
 - 本项目仅供学习交流使用，请遵守所在学校/机构的网络使用规定。使用本项目产生的一切后果由使用者自行承担。
 - 本脚本并非破解软件，不提供破解功能，无任何入侵和破解行为。
 - 本脚本免费发布并无任何盈利行为，请勿商用。
-
-## License
-
-[MIT](LICENSE)

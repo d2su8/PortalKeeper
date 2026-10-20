@@ -19,7 +19,7 @@ mod uci;
 
 use std::process::exit;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 fn usage() {
     println!(
@@ -28,6 +28,7 @@ fn usage() {
   portalkeeperd daemon            启动守护进程(读 /etc/config/portalkeeper)\n\
   portalkeeperd check             联通测试: 仅探测, 不登录(0=已在线 1=未认证/失败 2=无法判定)\n\
   portalkeeperd login             手动执行一次完整认证\n\
+  portalkeeperd offline           强制下线本机(新版门户令牌 API: 拿令牌→查本机→下线)\n\
   portalkeeperd status            查看守护进程线路状态(/tmp/portalkeeper.status)\n\
   portalkeeperd detect-portal     只探测门户地址(不登录); 探测不到会给出手动获取办法\n\
 选项(check/login 可用):\n\
@@ -55,6 +56,7 @@ fn main() {
         "daemon" => daemon::run(rest),
         "check" => cli_check(rest),
         "login" => cli_login(rest),
+        "offline" => cli_offline(rest),
         "status" => cli_status(),
         "detect-portal" => cli_detect_portal(rest),
         "version" | "--version" | "-v" => println!("portalkeeperd {}", VERSION),
@@ -84,8 +86,18 @@ fn resolve_line(rest: &[String]) -> (portal::LineCfg, String) {
         .into_iter()
         .find(|s| uci::get(s, "enabled").unwrap_or("1") != "0");
 
-    let pick = |from_line: (Option<String>, Option<String>, Option<String>, Option<String>),
-                from_main: (Option<String>, Option<String>, Option<String>, Option<String>)| {
+    let pick = |from_line: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ),
+                from_main: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )| {
         // (username, password, ua, device) 三级: 参数 > line > main
         let (lu, lp, lua, ldev) = from_line;
         let (mu, mp, mua, mdev) = from_main;
@@ -100,15 +112,27 @@ fn resolve_line(rest: &[String]) -> (portal::LineCfg, String) {
     let (username, password, ua, device) = match line {
         Some(sec) => pick(
             (
-                uci::get(sec, "username").map(|s| s.to_string()).filter(|s| !s.is_empty()),
-                uci::get(sec, "password").map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                uci::get(sec, "username")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty()),
+                uci::get(sec, "password")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty()),
                 uci::get(sec, "ua").map(|s| s.to_string()),
-                uci::get(sec, "device").map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                uci::get(sec, "device")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty()),
             ),
             (
-                main_sec.and_then(|m| uci::get(m, "username")).map(|s| s.to_string()),
-                main_sec.and_then(|m| uci::get(m, "password")).map(|s| s.to_string()),
-                main_sec.and_then(|m| uci::get(m, "ua")).map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "username"))
+                    .map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "password"))
+                    .map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "ua"))
+                    .map(|s| s.to_string()),
                 main_sec
                     .and_then(|m| uci::get(m, "device"))
                     .filter(|s| !s.is_empty())
@@ -118,9 +142,15 @@ fn resolve_line(rest: &[String]) -> (portal::LineCfg, String) {
         None => pick(
             (None, None, None, None),
             (
-                main_sec.and_then(|m| uci::get(m, "username")).map(|s| s.to_string()),
-                main_sec.and_then(|m| uci::get(m, "password")).map(|s| s.to_string()),
-                main_sec.and_then(|m| uci::get(m, "ua")).map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "username"))
+                    .map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "password"))
+                    .map(|s| s.to_string()),
+                main_sec
+                    .and_then(|m| uci::get(m, "ua"))
+                    .map(|s| s.to_string()),
                 main_sec
                     .and_then(|m| uci::get(m, "device"))
                     .filter(|s| !s.is_empty())
@@ -190,7 +220,7 @@ fn cli_check(rest: &[String]) {
             .map(|i| i.to_string())
             .unwrap_or_else(|| "自动检测".into()),
         line.ua,
-        if portal::parse_probe_url(&probe_url).is_some() {
+        if portal::has_custom_probe(&probe_url) {
             probe_url.trim()
         } else {
             "内置(默认)"
@@ -220,14 +250,8 @@ fn cli_login(rest: &[String]) {
         exit(1);
     }
     let timeout = std::time::Duration::from_secs(timeout_of(rest));
-    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let out2 = out.clone();
-    let log = move |s: &str| {
-        println!("{}", s);
-        out2.lock().unwrap().push(s.to_string());
-    };
+    let log = |s: &str| println!("{s}");
     let (ok, code, detail) = portal::authenticate(&line, &log, timeout);
-    let _ = out;
     match (ok, code) {
         (true, "already") => {
             println!("结论: 本机已在线, 无需操作");
@@ -282,6 +306,30 @@ fn cli_detect_portal(rest: &[String]) {
             println!("手动获取: 浏览器打开 http://www.msftconnecttest.com/connecttest.txt ,");
             println!("地址栏跳转后的地址整条填进 LuCI「认证服务 → 门户地址」即可。");
             exit(2);
+        }
+    }
+}
+
+/// 强制下线本机(新版门户令牌 API): 拿令牌 → 查在线列表 → forceOffline
+fn cli_offline(rest: &[String]) {
+    let (line, _) = resolve_line(rest);
+    if line.username.is_empty() || line.password.is_empty() {
+        eprintln!("!! 缺少账号或密码: 请在 LuCI 设置或 /etc/config/portalkeeper 中配置");
+        exit(1);
+    }
+    let log = |s: &str| println!("{s}");
+    match portal::force_offline(
+        &line,
+        &log,
+        std::time::Duration::from_secs(timeout_of(rest)),
+    ) {
+        Ok(msg) => {
+            println!("结论: {msg}");
+            exit(0);
+        }
+        Err(e) => {
+            println!("结论: {e}");
+            exit(1);
         }
     }
 }

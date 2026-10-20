@@ -1,5 +1,5 @@
 {
-	"luci-app-portalkeeper": {
+	"portalkeeper": {
 		"description": "校园网自动认证 (Portal Auto-Auth)",
 		"read": {
 			"uci": [ "portalkeeper" ],
@@ -23,7 +23,9 @@
 					"autostart_off",
 					"service_start",
 					"service_stop",
-					"apply"
+					"apply",
+					"force_offline",
+					"set_enabled"
 				]
 			}
 		}

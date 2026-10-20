@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 校园网自动认证 ipk 打包(免 OpenWrt SDK):
 #   1. 先按 BUILD.md 在 WSL Ubuntu 里交叉编译出 aarch64 musl 静态二进制 portalkeeperd
-#   2. 本脚本把 portalkeeperd + 配置/init 脚本 打成 portalkeeper_*.ipk
-#      并把 LuCI 视图/菜单/ACL/rpcd ucode 插件 打成 luci-app-portalkeeper_*.ipk (all 架构)
+#   2. 本脚本把 portalkeeperd + 配置/init 脚本 + LuCI 界面(视图/菜单/ACL/rpcd ucode)
+#      打成一个单包 portalkeeper_*.ipk(不再拆分 luci-app-portalkeeper)
 # 容器格式(与路由器 2021-06-13 版 opkg 实测匹配, 参照官方包与 luci-app-oxidns 实包):
 #   ipk 本体 = gzip 压缩的 PAX tar, 成员依次为 control.tar.gz → data.tar.gz
 #   (无 ./ 前缀、无 debian-binary 成员; 内层 tar 成员带 ./ 前缀与官方一致)
@@ -14,8 +14,8 @@ DEF_BIN="$ROOT/daemon/target/aarch64-unknown-linux-musl/release/portalkeeperd"
 BIN="${1:-$DEF_BIN}"
 OUT="$ROOT/build/out"
 STAGE="$OUT/.stage"
-ARCH="aarch64_cortex-a53"
-REL=1
+ARCH="${ARCH:-aarch64_cortex-a53}"
+REL="${REL:-1}"
 
 [ -x "$BIN" ] || {
 	echo "!! 未找到 portalkeeperd 二进制: $BIN"
@@ -63,13 +63,16 @@ make_ipk() {
 	echo "生成: $ipk"
 }
 
-# ---------- 1) portalkeeper (核心守护, 静态二进制) ----------
+# ---------- 单包 portalkeeper (守护进程 + LuCI 界面一体) ----------
 DATA="$STAGE/portalkeeper-data"
-mkdir -p "$DATA/usr/bin" "$DATA/etc/init.d" "$DATA/etc/uci-defaults"
+mkdir -p "$DATA/usr/bin" "$DATA/etc/init.d" "$DATA/etc/uci-defaults" "$DATA/www"
 install -m 0755 "$BIN" "$DATA/usr/bin/portalkeeperd"
 install -m 0755 "$ROOT/portalkeeper/files/etc/init.d/portalkeeper" "$DATA/etc/init.d/portalkeeper"
 # uci-defaults 脚本必须可执行, 否则开机初始化不会运行(实测 0644 导致 Permission denied)
 install -m 0755 "$ROOT/portalkeeper/files/etc/uci-defaults/99-portalkeeper" "$DATA/etc/uci-defaults/99-portalkeeper"
+# LuCI 界面: usr 下是 menu.d / rpcd(acl.d + ucode); 视图运行时路径是 /www/luci-static(仓库放 htdocs, 映射到 www)
+cp -a "$ROOT/portalkeeper/usr" "$DATA/"
+cp -a "$ROOT/portalkeeper/htdocs/luci-static" "$DATA/www/"
 
 CTLDIR="$STAGE/portalkeeper-control"
 mkdir -p "$CTLDIR"
@@ -79,34 +82,19 @@ Version: ${VER}-${REL}
 Architecture: ${ARCH}
 Maintainer: PortalKeeper contributors
 Section: net
-Description: 校园网自动认证守护进程(周期探测门户劫持并认证保活)。Rust 静态编译, 日志仅写 /tmp。
+Depends: luci-base, rpcd, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-ubus
+Provides: luci-app-portalkeeper
+Conflicts: luci-app-portalkeeper
+Replaces: luci-app-portalkeeper
+Description: 校园网自动认证守护进程(周期探测门户劫持并认证保活) + LuCI 管理界面。Rust 静态编译, 日志仅写 /tmp。
 Installed-Size: $(du -sk "$DATA" | cut -f1)
 EOF
-make_ipk "portalkeeper" "${VER}-${REL}" "${ARCH}" "$DATA" "$CTLDIR"
 
-# ---------- 2) luci-app-portalkeeper (纯数据包, all 架构) ----------
-DATA="$STAGE/luci-data"
-mkdir -p "$DATA/www"
-cp -a "$ROOT/luci-app-portalkeeper/usr" "$DATA/"
-# 视图运行时路径是 /www/luci-static(仓库里放 htdocs, 打包时映射到 www)
-cp -a "$ROOT/luci-app-portalkeeper/htdocs/luci-static" "$DATA/www/"
-
-CTLDIR="$STAGE/luci-control"
-mkdir -p "$CTLDIR"
-cat > "$CTLDIR/control" <<EOF
-Package: luci-app-portalkeeper
-Version: ${VER}-${REL}
-Architecture: all
-Depends: portalkeeper, luci-base, rpcd, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-ubus
-Maintainer: PortalKeeper contributors
-Section: luci
-Description: 校园网自动认证 LuCI 界面(概览/基本设置/高级设置/日志)。
-Installed-Size: $(du -sk "$DATA" | cut -f1)
-EOF
-# 安装/卸载后清 LuCI 缓存并重启 rpcd(参照 luci-app-oxidns 实包做法)
+# 安装后: 首次安装执行 uci-defaults(建默认配置 + 开机自启链接) + 清 LuCI 缓存 + 重启 rpcd(菜单/视图刷新)
 cat > "$CTLDIR/postinst" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
+[ -x /etc/uci-defaults/99-portalkeeper ] && /etc/uci-defaults/99-portalkeeper || true
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache/* 2>/dev/null || true
 if [ -d /www/luci-static/resources/view/portalkeeper ]; then
@@ -125,10 +113,9 @@ rm -rf /tmp/luci-modulecache/* 2>/dev/null || true
 exit 0
 EOF
 chmod 0755 "$CTLDIR/postinst" "$CTLDIR/postrm"
-make_ipk "luci-app-portalkeeper" "${VER}-${REL}" "all" "$DATA" "$CTLDIR"
+make_ipk "portalkeeper" "${VER}-${REL}" "${ARCH}" "$DATA" "$CTLDIR"
 
 echo
-echo "完成。安装方法:"
+echo "完成。安装方法(单包, 守护进程 + LuCI 界面一体):"
 echo "  cat $OUT/portalkeeper_*.ipk | ssh root@<路由器IP> 'cat > /tmp/portalkeeper.ipk'"
-echo "  cat $OUT/luci-app-portalkeeper_*_all.ipk | ssh root@<路由器IP> 'cat > /tmp/luci-app-portalkeeper.ipk'"
-echo "  ssh root@<路由器IP> 'opkg install /tmp/portalkeeper.ipk /tmp/luci-app-portalkeeper.ipk'"
+echo "  ssh root@<路由器IP> 'opkg install /tmp/portalkeeper.ipk'"

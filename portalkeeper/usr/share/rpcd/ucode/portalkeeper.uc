@@ -42,6 +42,23 @@ function autostart_enabled() {
 	return false;
 }
 
+// 守护进程版本(函数定义不提升, read_status 定义在 exec() 之前, 故这里用顶层 import 的 popen;
+// 注意: 本固件 ucode 的字符串无原型方法链, 用全局 split() 取版本段)
+function daemon_version() {
+	const p = popen(CLI + ' version 2>/dev/null', 'r');
+
+	if (p == null)
+		return '';
+
+	const out = p.read('all');
+
+	p.close();
+
+	const parts = split(trim(out || ''), ' ');
+
+	return (length(parts) > 1) ? parts[1] : '';
+}
+
 function read_status() {
 	const uci = cursor();
 	const portal = uci.get('portalkeeper', 'main', 'portal_url') || '';
@@ -50,8 +67,12 @@ function read_status() {
 		daemon_running: service_running(),
 		autostart: autostart_enabled(),
 		updated_human: '',
+		// 守护进程版本(状态卡「版本」链接展示用)
+		version: daemon_version(),
+		enabled: uci.get('portalkeeper', 'main', 'enabled') == '1',
 		// 自助管理后台(新版门户是 /self/ 下的 SPA); 配了门户地址就按它拼
-		self_url: portal != '' ? portal.replace(/\/+$/, '') + '/self/' : DEFAULT_SELF_URL,
+		// 注意: 本固件 ucode 的字符串无 .replace 原型方法, 用全局 rtrim 去尾部斜杠
+		self_url: portal != '' ? rtrim(portal, '/') + '/self/' : DEFAULT_SELF_URL,
 		lines: []
 	};
 
@@ -304,6 +325,35 @@ const methods = {
 	apply: {
 		call: function(req) {
 			return { ok: true, output: exec(INIT + ' restart 2>&1') };
+		}
+	},
+
+	// 强制下线本机(新版门户令牌 API, 由 portalkeeperd offline 完成):
+	// 拿令牌 → 查在线列表找本机 → forceOffline。耗时数秒, ubus 同步等待。
+	force_offline: {
+		call: function(req) {
+			let out = exec(CLI + ' offline --timeout 10 2>&1');
+
+			if (out == null)
+				out = '无法执行 /usr/bin/portalkeeperd';
+
+			return { output: out };
+		}
+	},
+
+	// 状态卡的「启用」开关: 写 uci 并立即启停服务(不等「保存并应用」)
+	set_enabled: {
+		args: { value: 'string' },
+		call: function(req) {
+			let val = (type(req.args) == 'object' && req.args.value == '1') ? '1' : '0';
+			const uci = cursor();
+
+			uci.set('portalkeeper', 'main', 'enabled', val);
+			uci.commit('portalkeeper');
+
+			const output = exec(INIT + ((val == '1') ? ' start' : ' stop') + ' 2>&1');
+
+			return { ok: true, enabled: (val == '1'), output: output || '' };
 		}
 	},
 

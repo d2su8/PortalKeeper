@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# PortalKeeper 打包(新版 OpenWrt / apk): 生成 APKv3 包
-#   portalkeeper_<版本>-r1.apk            核心守护(静态二进制 + procd init + UCI 默认配置)
-#   luci-app-portalkeeper_<版本>-r1.apk   LuCI 界面(视图/菜单/ACL/rpcd ucode)
+# PortalKeeper 打包(新版 OpenWrt / apk): 生成 APKv3 单包
+#   portalkeeper_<版本>-r1.apk   守护进程 + LuCI 界面一体(静态二进制 + procd init + UCI 默认配置 + 视图/菜单/ACL/rpcd ucode)
+#
+# 单包整合, 不再拆分 luci-app-portalkeeper。
 #
 # 适用固件: 包管理器为 apk 的 OpenWrt(apk-tools 3.x, 包格式 APKv3/ADB, 魔数 "ADBd")。
 #           老固件(opkg, 包格式 ipk)请用同目录的 build-ipk.sh。
@@ -21,8 +22,8 @@ DEF_BIN="$ROOT/daemon/target/aarch64-unknown-linux-musl/release/portalkeeperd"
 BIN="${1:-$DEF_BIN}"
 OUT="$ROOT/build/out-apk"
 STAGE="$OUT/.stage"
-ARCH="aarch64_cortex-a53"
-REL=1
+ARCH="${ARCH:-aarch64_cortex-a53}"
+REL="${REL:-1}"
 APK="${APK:-$HOME/apktool/apk.static}"
 URL_REPO="https://github.com/d2su8/PortalKeeper"
 
@@ -64,7 +65,7 @@ fix_ownership() {
 # 说明: --info 的 "键:值" 只在第一个冒号处切分, 值里可以带 https:// 这类冒号
 make_apk() {
 	local name="$1" data="$2" desc="$3" depends="$4" postinst="${5:-}"
-	local out="$OUT/${name}_${VER}-r${REL}.apk"
+	local out="$OUT/${name}_${VER}-r${REL}_${ARCH}.apk"
 	rm -f "$out"
 	local args=(
 		mkpkg
@@ -92,39 +93,22 @@ make_apk() {
 	echo "生成: $out"
 }
 
-# ---------- 1) portalkeeper (核心守护) ----------
+# ---------- 单包 portalkeeper (守护进程 + LuCI 界面一体) ----------
 DATA="$STAGE/portalkeeper-data"
-mkdir -p "$DATA/usr/bin" "$DATA/etc/init.d" "$DATA/etc/uci-defaults"
+mkdir -p "$DATA/usr/bin" "$DATA/etc/init.d" "$DATA/etc/uci-defaults" "$DATA/www"
 install -m 0755 "$BIN" "$DATA/usr/bin/portalkeeperd"
 install -m 0755 "$ROOT/portalkeeper/files/etc/init.d/portalkeeper" "$DATA/etc/init.d/portalkeeper"
 install -m 0755 "$ROOT/portalkeeper/files/etc/uci-defaults/99-portalkeeper" "$DATA/etc/uci-defaults/99-portalkeeper"
+# LuCI 界面: usr 下是 menu.d / rpcd(acl.d + ucode); 视图运行时路径是 /www/luci-static(仓库放 htdocs, 映射到 www)
+cp -a "$ROOT/portalkeeper/usr" "$DATA/"
+cp -a "$ROOT/portalkeeper/htdocs/luci-static" "$DATA/www/"
 
 POST="$STAGE/portalkeeper-postinst"
 cat > "$POST" <<'EOF'
 #!/bin/sh
-# 首次安装即执行一次 uci-defaults(建默认配置 + 建开机自启链接); 脚本自身幂等
-[ -x /etc/uci-defaults/99-portalkeeper ] && /etc/uci-defaults/99-portalkeeper || true
-exit 0
-EOF
-chmod 0755 "$POST"
-
-fix_ownership "$DATA"
-make_apk "portalkeeper" "$DATA" \
-	"校园网自动认证守护进程(周期探测门户劫持并认证保活)。Rust 静态编译, 日志仅写 /tmp。" \
-	"" "$POST"
-
-# ---------- 2) luci-app-portalkeeper (LuCI 界面) ----------
-DATA="$STAGE/luci-data"
-mkdir -p "$DATA/www"
-cp -a "$ROOT/luci-app-portalkeeper/usr" "$DATA/"
-# 视图运行时路径是 /www/luci-static(仓库里放 htdocs, 打包时映射到 www)
-cp -a "$ROOT/luci-app-portalkeeper/htdocs/luci-static" "$DATA/www/"
-
-POST="$STAGE/luci-postinst"
-cat > "$POST" <<'EOF'
-#!/bin/sh
-# 安装后清 LuCI 缓存并重启 rpcd(否则菜单/视图不刷新)
+# 首次安装即执行 uci-defaults(建默认配置 + 建开机自启链接); 再清 LuCI 缓存并重启 rpcd(菜单/视图刷新)
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
+[ -x /etc/uci-defaults/99-portalkeeper ] && /etc/uci-defaults/99-portalkeeper || true
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache/* 2>/dev/null || true
 if [ -d /www/luci-static/resources/view/portalkeeper ]; then
@@ -138,15 +122,14 @@ EOF
 chmod 0755 "$POST"
 
 fix_ownership "$DATA"
-make_apk "luci-app-portalkeeper" "$DATA" \
-	"校园网自动认证 LuCI 界面(概览/高级设置/日志)。" \
-	"portalkeeper luci-base rpcd ucode" "$POST"
+make_apk "portalkeeper" "$DATA" \
+	"校园网自动认证守护进程(周期探测门户劫持并认证保活) + LuCI 管理界面。Rust 静态编译, 日志仅写 /tmp。" \
+	"luci-base rpcd ucode" "$POST"
 
 rm -rf "$STAGE"
 
 echo
-echo "完成。安装方法(新版 apk 固件):"
+echo "完成。安装方法(新版 apk 固件, 单包):"
 echo "  cat $OUT/portalkeeper_*.apk | ssh root@<路由器IP> 'cat > /tmp/portalkeeper.apk'"
-echo "  cat $OUT/luci-app-portalkeeper_*.apk | ssh root@<路由器IP> 'cat > /tmp/luci-app-portalkeeper.apk'"
-echo "  ssh root@<路由器IP> 'apk add --allow-untrusted --force-broken-world /tmp/portalkeeper.apk /tmp/luci-app-portalkeeper.apk'"
+echo "  ssh root@<路由器IP> 'apk add --allow-untrusted /tmp/portalkeeper.apk'"
 echo "(本地未签名的包要带 --allow-untrusted; 若缺依赖先 apk update)"

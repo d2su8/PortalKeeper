@@ -1,0 +1,133 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 单测 + lint(宿主机 target, 交叉 target 跑不了测试): 不通过就不许打包
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Unit tests
+        run: cargo test --manifest-path daemon/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+
+      - name: rustfmt check
+        run: cargo fmt --check --manifest-path daemon/Cargo.toml
+
+      - name: Version consistency (Cargo.toml vs Makefile)
+        run: |
+          set -euo pipefail
+          CV=$(grep -m1 '^version' daemon/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          MV=$(grep -m1 '^PKG_VERSION' portalkeeper/Makefile | sed 's/.*:=//' | tr -d '[:space:]')
+          echo "Cargo.toml=$CV  Makefile=$MV"
+          if [ "$CV" != "$MV" ]; then
+            echo "::error::版本号不一致: daemon/Cargo.toml=$CV, portalkeeper/Makefile=$MV"
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64_cortex-a53
+            target: aarch64-unknown-linux-musl
+            image: aarch64-musl
+          - arch: arm_cortex-a7
+            target: armv7-unknown-linux-musleabihf
+            image: armv7-musleabihf
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            image: x86_64-musl
+          - arch: mipsel_24kc
+            target: mipsel-unknown-linux-musl
+            image: mipsel-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 交叉编译用 rust-cross 的 Docker 镜像(musl-cross-make 工具链 + 对应 target 的
+      # Rust std 都打进镜像), 不再从 musl.cc 下载工具链(该站对 GitHub Actions 不稳定,
+      # 4 架构会同时失败); mipsel 也顺带解决 —— rustup stable 已不再分发
+      # mipsel-unknown-linux-musl 的 rust-std, 而镜像自带编译好的 sysroot。
+      # 镜像内 gcc 名为 <triple>-gcc, 与仓库 .cargo/config.toml 的 musl.cc 命名不同,
+      # 用 --config 覆盖 linker(命令行 --config 优先级最高); rustflags 仍走配置文件。
+      - name: Build static binary
+        run: |
+          set -euo pipefail
+          TRIPLE="${{ matrix.target }}"
+          docker run --rm \
+            -v "$PWD:/home/rust/src" \
+            -w /home/rust/src/daemon \
+            "ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }}" \
+            cargo build --release --target "$TRIPLE" \
+              --config "target.${TRIPLE}.linker='${TRIPLE}-gcc'"
+
+      - name: Fetch apk-tools (static)
+        run: |
+          curl -fsSL https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/apk-tools-static-3.0.8-r0.apk -o apk-tools.apk
+          tar xzf apk-tools.apk sbin/apk.static
+          chmod +x sbin/apk.static
+
+      - name: Package apk
+        run: |
+          sudo env "ARCH=${{ matrix.arch }}" "APK=$PWD/sbin/apk.static" \
+            bash build/build-apk.sh "daemon/target/${{ matrix.target }}/release/portalkeeperd"
+
+      - name: Package ipk
+        run: |
+          ARCH="${{ matrix.arch }}" bash build/build-ipk.sh \
+            "daemon/target/${{ matrix.target }}/release/portalkeeperd"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: portalkeeper-${{ matrix.arch }}
+          path: |
+            build/out-apk/*.apk
+            build/out/*.ipk
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
