@@ -57,7 +57,7 @@ authentication, built as a single static Rust binary.
    opkg remove portalkeeper  # 老固件(配置 /etc/config/portalkeeper 会保留, 需手动删除)
    ```
 
-打开 LuCI → **服务 → PortalKeeper** → 填账号密码 → 勾选「启用」。
+打开 LuCI → **服务 → PortalKeeper** → 填账号密码 → 在顶部状态卡勾选「启用」→ 点「保存并应用」。
 
 账号密码明文存于 `/etc/config/portalkeeper`，请勿外传配置文件。
 

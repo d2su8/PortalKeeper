@@ -1,6 +1,7 @@
 #!/bin/sh /etc/rc.common
 # 校园网认证守护 procd 服务
-# 启用开关 = UCI main.enabled(由 LuCI「保存并应用」写入);
+# 启用开关 = UCI main.enabled(LuCI 顶部状态卡勾选「启用」, 「保存并应用」写入);
+# 「保存并应用」走 config.change → reload_service, 按 enabled 门控启停
 # 开机时 rc.d 链接调用 start, start_service 内按 enabled 门控是否真正启动。
 
 START=99
@@ -18,7 +19,7 @@ start_service() {
 	config_load portalkeeper
 	config_get_bool enabled main enabled 0
 	if [ "$enabled" != "1" ]; then
-		log_line "服务未启动: 总开关处于关闭状态(勾选「启用」并保存应用后即可启动)"
+		log_line "服务未启动: 总开关处于关闭状态(在顶部状态卡勾选「启用」并保存应用后即可启动)"
 		return 0
 	fi
 	if [ ! -x /usr/bin/portalkeeperd ]; then

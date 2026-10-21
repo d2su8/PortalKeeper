@@ -13,7 +13,6 @@ var callRunCheck = rpc.declare({ object: 'portalkeeper', method: 'runcheck', par
 var callGetLog = rpc.declare({ object: 'portalkeeper', method: 'getlog', expect: {} });
 var callClearLog = rpc.declare({ object: 'portalkeeper', method: 'clearlog', expect: {} });
 var callForceOffline = rpc.declare({ object: 'portalkeeper', method: 'force_offline', expect: {} });
-var callSetEnabled = rpc.declare({ object: 'portalkeeper', method: 'set_enabled', params: [ 'value' ], expect: {} });
 // 重启服务(等价 /etc/init.d/portalkeeper restart): 改完账号/网卡等配置后让改动立即生效
 var callApply = rpc.declare({ object: 'portalkeeper', method: 'apply', expect: {} });
 
@@ -23,7 +22,7 @@ var SELF_URL = 'http://10.255.2.249/self/';
 // 项目主页(版本号链接指向这里)
 var REPO_URL = 'https://github.com/d2su8/PortalKeeper';
 
-var statusBodyEl = null;     // 状态卡动态部分(运行状态 + 运行统计, 5 秒轮询重绘)
+var statusBodyEl = null;     // 状态卡动态部分(运行状态/开关/运行统计, 5 秒轮询重绘)
 var checkDetailEl = null;    // 主线路探测的原始输出
 var panelsBoxEl = null;      // 线路信息
 var offlineOutEl = null;     // 强制下线的执行输出
@@ -152,7 +151,16 @@ function checkButton(view) {
 	}, _('网络联通测试'));
 }
 
-// 状态卡动态部分: 运行状态(红/绿) + 运行统计(掉线/重连成功/失败/最近失败原因)
+// 状态行: 左标签(定宽对齐) + 右值, 竖排布局(参考同类插件的状态卡)
+function statusRow(label, valueNode) {
+	return E('div', { 'style': 'display:flex; align-items:flex-start; gap:12px' }, [
+		E('span', { 'class': 'cbi-value-description', 'style': 'flex:0 0 5em; white-space:nowrap' }, label),
+		E('div', { 'style': 'flex:1; min-width:0' }, valueNode)
+	]);
+}
+
+// 状态卡动态部分: 运行状态(红/绿) + 运行统计(掉线/重连成功/失败/最近失败原因), 5 秒轮询重绘
+// (开关态看第一行的复选框本身, 不再单列一行)
 function renderStatusBody(status) {
 	var running = (status && status.daemon_running === true);
 	var st = lineStats(status);
@@ -161,17 +169,11 @@ function renderStatusBody(status) {
 		  (st.lastFail ? ' · 最近失败: ' + st.lastFail : '')
 		: '暂无数据(守护进程未运行或尚未检测)';
 
-	return hrow([
-		E('span', { 'style': 'white-space:nowrap' }, [
-			E('span', { 'class': 'cbi-value-description' }, '运行状态 '),
-			E('span', {
-				'style': 'color:' + vColor(running ? 'success' : 'danger') + '; font-weight:600'
-			}, running ? '运行中' : '未运行')
-		]),
-		E('span', {}, [
-			E('span', { 'class': 'cbi-value-description' }, '运行统计 '),
-			statsText
-		])
+	return E('div', { 'style': 'display:flex; flex-direction:column; gap:6px' }, [
+		statusRow('运行状态', E('span', {
+			'style': 'color:' + vColor(running ? 'success' : 'danger') + '; font-weight:600'
+		}, running ? '运行中' : '未运行')),
+		statusRow('运行统计', E('span', {}, statsText))
 	]);
 }
 
@@ -318,10 +320,28 @@ function fillDeviceOptions(o, ifaces, extras) {
 	}
 }
 
-// 认证设置表单: main section(启用开关已上移到顶部状态卡)
+// 「启用」开关(顶部状态卡): 独立小表单, main section 只有 enabled 一个字段。
+// 生效方式与其它表单一致: 页面底部「保存并应用」→ luci.js 的 View.handleSave 会遍历
+// #maincontent 下所有 .cbi-map 逐一 save → uci commit → config.change → procd reload
+// → init.d reload_service 按 main.enabled 门控启停(该链路已实测)。
+// 不用即时生效方案(勾选即写 uci + 启停服务): 误触就停认证, 用户要求保存并应用后才生效。
+// 外观由 render() 里 #pk-enabled-wrap 的样式拍平(去框/去说明), 与参考插件一样竖排。
+function buildEnabledMap() {
+	var m = new form.Map('portalkeeper', null, null);
+	var s = m.section(form.NamedSection, 'main', 'portalkeeper', null);
+	s.addremove = false;
+
+	var o = s.option(form.Flag, 'enabled', _('启用'));
+	o.default = '0';
+	o.rmempty = false;
+
+	return m;
+}
+
+// 认证设置表单: main section(账号参数; 总开关在顶部状态卡, 见 buildEnabledMap)
 function buildAuthMap(ifaces, extras) {
 	var m = new form.Map('portalkeeper', _('认证设置'),
-		_('主线路认证所需的账号与参数。填好后到顶部「状态」卡勾选「启用」即可启动服务; 留空的项使用自动检测或内置默认值。'));
+		_('主线路认证所需的账号与参数。填好后到顶部状态卡勾选「启用」, 点页面底部「保存并应用」启动服务; 留空的项使用自动检测或内置默认值。'));
 	var s = m.section(form.NamedSection, 'main', 'portalkeeper', _('认证服务'));
 	s.addremove = false;
 
@@ -584,40 +604,15 @@ return view.extend({
 
 		var self = this;
 
-		// 状态卡「启用」开关: 即时生效(写 uci + 启停服务), 不依赖「保存并应用」
-		var enabledCb = E('input', {
-			'type': 'checkbox',
-			'id': 'pk-enabled',
-			'style': 'vertical-align:middle',
-			'change': function(ev) {
-				var cb = ev.target;
-				var val = cb.checked ? '1' : '0';
-
-				cb.disabled = true;
-
-				return callSetEnabled(val).then(function() {
-					cb.disabled = false;
-					ui.showNotification(_('认证服务已' + (val == '1' ? '启动' : '停止')), 3000);
-
-					return callGetStatus().catch(function() { return lastStatus; }).then(function(d) {
-						lastStatus = d;
-						paintStatus(d);
-					});
-				}).catch(function(e) {
-					cb.disabled = false;
-					ui.showNotification(_('操作失败: ') + e, 5000);
-				});
-			}
-		});
-		enabledCb.checked = (data.status && data.status.enabled === true);
-
-		// 两个表单各自渲染(异步), 分别放进「认证设置」「高级设置」标签页
+		// 三个表单各自渲染(异步): 启用开关放进状态卡, 账号参数/第二线路放各自标签页
 		return Promise.all([
+			buildEnabledMap().render(),
 			buildAuthMap(ifs, extra).render(),
 			buildAdvancedMap(ifs, extra).render()
 		]).then(function(res) {
-			var authEl = res[0];
-			var advancedEl = res[1];
+			var enabledMapEl = res[0];
+			var authEl = res[1];
+			var advancedEl = res[2];
 
 			var view = E('div', { 'class': 'cbi-map' }, [
 				E('h2', {}, 'PortalKeeper'),
@@ -637,24 +632,28 @@ return view.extend({
 					])
 				]),
 
-				// 顶部状态卡: 启用开关 + 重启服务 + 运行状态 + 运行统计(常驻所有标签页)
+				// 顶部状态卡(整模块保留主题的卡片框): 「启用」开关(小表单, 保存并应用生效)
+				// + 重启服务按钮(旁边) + 只读的运行状态/运行统计(竖排, 常驻所有标签页;
+				// 开关态看复选框本身)。小表单自身那层嵌套框由下面 #pk-enabled-wrap 的
+				// 样式拍平, 只保留最外层这一张卡
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('状态')),
-					E('div', { 'style': 'display:flex; flex-wrap:wrap; gap:24px; align-items:center; margin:6px 0' }, [
-						// 左列: 启用开关(上) + 重启服务按钮(下)
-						E('div', { 'style': 'display:flex; flex-direction:column; gap:8px; align-items:flex-start' }, [
-							E('label', {
-								'for': 'pk-enabled',
-								'style': 'display:flex; align-items:center; gap:6px; cursor:pointer; white-space:nowrap'
-							}, [ enabledCb, _('启用') ]),
-							E('button', {
-								'class': 'btn cbi-button cbi-button-apply',
-								'title': '重启认证服务(等价 /etc/init.d/portalkeeper restart); 改完账号/网卡/门户地址等配置后点这里立即生效',
-								'click': ui.createHandlerFn(self, 'handleRestart')
-							}, _('重启服务'))
-						]),
-						(statusBodyEl = E('div', { 'id': 'pk-status-body' }))
-					])
+					// 拍平小表单的卡片外观(去框/去内边距), 标签定宽与下面两行对齐
+					E('style', {}, '#pk-enabled-wrap .cbi-section{border:0;background:none;box-shadow:none;border-radius:0;padding:0;margin:0}' +
+						'#pk-enabled-wrap .cbi-value{margin:0;padding:0;align-items:center}' +
+						'#pk-enabled-wrap .cbi-value>.cbi-value-title{flex:0 0 5em;width:5em;text-align:left;padding-top:0}' +
+						'#pk-enabled-wrap .cbi-value>.cbi-value-field{flex:0 0 auto;padding:0;max-width:none}'),
+					// 第一行: 启用开关 + 重启服务按钮
+					E('div', { 'style': 'display:flex; align-items:center; flex-wrap:wrap; gap:8px 16px; margin:6px 0' }, [
+						E('div', { 'id': 'pk-enabled-wrap' }, enabledMapEl),
+						E('button', {
+							'class': 'btn cbi-button cbi-button-apply',
+							'title': '重启认证服务(等价 /etc/init.d/portalkeeper restart); 改完账号/网卡/门户地址等配置并「保存并应用」后, 也可以用这个按钮立即重启',
+							'click': ui.createHandlerFn(self, 'handleRestart')
+						}, _('重启服务'))
+					]),
+					// 下面: 只读运行状态/运行统计(5 秒轮询重绘)
+					(statusBodyEl = E('div', { 'id': 'pk-status-body' }))
 				]),
 
 				// 标签页导航
@@ -683,7 +682,7 @@ return view.extend({
 							spacer(),
 							E('span', { 'class': 'cbi-value-description', 'style': 'font-size:12px; flex:1 1 420px' },
 								'「强制下线本机」自动完成拿令牌→查本机→下线, 适合换槽位前释放本机; ' +
-								'下线后守护进程会按「掉线自动重试」配置自动重新认证, 如需保持下线请先到顶部状态卡取消「启用」。' +
+								'下线后守护进程会按「掉线自动重试」配置自动重新认证, 如需保持下线请先到顶部状态卡取消「启用」并保存应用。' +
 								'换槽位必须清除绑定, 可到自助后台「在线设备」对本机执行「按 MAC 下线(清除绑定)」。本插件不自动顶号。')
 						]),
 						(offlineOutEl = E('div', { 'id': 'portalkeeper-offline-out', 'style': 'margin-top:6px' }))

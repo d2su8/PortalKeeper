@@ -341,7 +341,9 @@ const methods = {
 		}
 	},
 
-	// 状态卡的「启用」开关: 写 uci 并立即启停服务(不等「保存并应用」)
+	// 脚本用「启用」开关: 写 uci 并立即启停服务(不等「保存并应用」)。
+	// LuCI 界面不走这条(界面在状态卡勾选「启用」, 随表单「保存并应用」生效),
+	// 保留给命令行/脚本即时控制: ubus call portalkeeper set_enabled '{"value":"1"}'
 	set_enabled: {
 		args: { value: 'string' },
 		call: function(req) {
