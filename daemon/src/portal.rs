@@ -12,7 +12,6 @@
 //! 4. 撞槽位绝不自动顶号, 只提示到自助管理后台手动下线
 
 use std::net::Ipv4Addr;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -26,10 +25,9 @@ pub const SELF_SERVICE_URL: &str = "http://10.255.2.249/self/";
 const GATEWAY_PATH: &str = "/tmp/portalkeeper.gateway";
 
 /// 探测地址 (host, path)
-pub const PROBE_URLS: [(&str, &str); 3] = [
+pub const PROBE_URLS: [(&str, &str); 2] = [
     ("www.msftconnecttest.com", "/connecttest.txt"),
     ("connect.rom.miui.com", "/generate_204"),
-    ("www.baidu.com", "/"),
 ];
 
 /// 电脑端 UA (占 PC 槽)
@@ -86,6 +84,8 @@ pub struct LineCfg {
     /// 手动指定的门户地址(留空 = 只用劫持自动发现);
     /// 可填基地址 http://10.10.0.1 或从浏览器抄来的完整登录页地址
     pub portal_url: String,
+    pub trusted_portal: String,
+    pub probe_url: String,
     /// 出口网卡名(如 eth1); None=按源 IP/默认路由
     pub device: Option<String>,
     /// 绑定源 IP; None=自动探测
@@ -102,6 +102,111 @@ pub enum ProbeState {
     Captive(String),
     Unreachable(String),
     Inconclusive,
+    Mixed,
+}
+
+/// Compare the scheme, host, and effective port. Reject ambiguous authorities.
+pub fn portal_origin(url: &str) -> Option<String> {
+    if url
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|p| *p != 0)?),
+        None => (authority, default_port),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+    {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(if port == default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    })
+}
+
+fn join_portal_location(url: &str, location: &str) -> Option<String> {
+    let origin = portal_origin(url)?;
+    let location = location.trim();
+    if location.is_empty() || location.starts_with('#') {
+        return None;
+    }
+    let joined = if location.starts_with("//") {
+        format!("{}:{location}", origin.split(':').next()?)
+    } else if location.starts_with('/') {
+        format!("{origin}{location}")
+    } else if location.split('/').next()?.contains(':') {
+        location.to_string()
+    } else {
+        let authority = url.split_once("://")?.1;
+        let path_index = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+        let path = authority[path_index..].split(['?', '#']).next()?;
+        if location.starts_with('?') {
+            format!("{origin}{path}{location}")
+        } else {
+            let directory = path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+            format!("{origin}{directory}/{location}")
+        }
+    };
+    portal_origin(&joined).map(|_| joined)
+}
+
+fn probe_response_is_online(host: &str, path: &str, status: u16, body: &[u8]) -> bool {
+    match (host, path) {
+        ("www.msftconnecttest.com", "/connecttest.txt") => {
+            status == 200 && String::from_utf8_lossy(body).trim() == "Microsoft Connect Test"
+        }
+        ("connect.rom.miui.com", "/generate_204") => status == 204 && body.is_empty(),
+        _ => status == 200 || status == 204,
+    }
+}
+
+fn summarize_probes(states: impl IntoIterator<Item = ProbeState>) -> ProbeState {
+    let mut online = false;
+    let mut captive: Option<String> = None;
+    let mut error = None;
+    for state in states {
+        match state {
+            ProbeState::Online => online = true,
+            ProbeState::Captive(url) => {
+                if captive
+                    .as_ref()
+                    .is_some_and(|first| portal_origin(first) != portal_origin(&url))
+                {
+                    return ProbeState::Mixed;
+                }
+                captive.get_or_insert(url);
+            }
+            ProbeState::Unreachable(msg) => {
+                error.get_or_insert(msg);
+            }
+            _ => {}
+        }
+    }
+    match (online, captive, error) {
+        (true, Some(_), _) => ProbeState::Mixed,
+        (true, None, _) => ProbeState::Online,
+        (false, Some(url), _) => ProbeState::Captive(url),
+        (false, None, Some(msg)) => ProbeState::Unreachable(msg),
+        _ => ProbeState::Inconclusive,
+    }
 }
 
 /// 探测单个地址
@@ -113,14 +218,19 @@ fn probe_one(client: &HttpClient, host: &str, path: &str) -> ProbeState {
         None,
     ) {
         Ok(resp) => {
-            if let Some(loc) = resp.header("Location") {
+            if let Some(loc) = resp
+                .header("Location")
+                .filter(|_| (300..400).contains(&resp.status))
+            {
                 // 跨主机/相对路径 => 被劫持; 同主机跳转(如 baidu http→https) => 无结论
                 return match captive_target(host, loc) {
-                    Some(url) => ProbeState::Captive(url),
-                    None => ProbeState::Inconclusive,
+                    Some(url) if portal_origin(&url).is_some() => ProbeState::Captive(url),
+                    _ => ProbeState::Inconclusive,
                 };
             }
-            if resp.status == 200 || resp.status == 204 {
+            if resp.header("Location").is_none()
+                && probe_response_is_online(host, path, resp.status, &resp.body)
+            {
                 return ProbeState::Online;
             }
             ProbeState::Inconclusive
@@ -164,25 +274,14 @@ pub fn url_base(url: &str) -> String {
 /// - 绝对地址: 主机与请求主机相同 → 正常跳转(如 http→https); 不同 → 劫持
 pub fn captive_target(requested_host: &str, loc: &str) -> Option<String> {
     let loc = loc.trim();
-    if loc.is_empty() {
+    let url = join_portal_location(&format!("http://{requested_host}/"), loc)?;
+    if loc.starts_with('/') && !loc.starts_with("//") {
+        return Some(url);
+    }
+    if url_host(&url).eq_ignore_ascii_case(url_host(requested_host)) {
         return None;
     }
-    if loc.starts_with('/') {
-        return Some(format!("http://{requested_host}{loc}"));
-    }
-    if let Some(rest) = loc.strip_prefix("https://") {
-        let host = rest.split(['/', ':']).next().unwrap_or("");
-        return if host.eq_ignore_ascii_case(requested_host) {
-            None
-        } else {
-            Some(loc.to_string())
-        };
-    }
-    let host = url_host(loc);
-    if host.is_empty() || host.eq_ignore_ascii_case(requested_host) {
-        return None;
-    }
-    Some(loc.to_string())
+    Some(url)
 }
 
 /// 该地址是否像门户登录页(含 password 输入框或门户特征词)
@@ -249,38 +348,31 @@ pub fn probe_targets(custom: &str) -> Vec<(String, String)> {
 /// 并发探测地址表, 任一给出结论即返回 (Some(true)=在线 / Some(false)=被劫持 / None=无结论)。
 /// custom_probe 为空 = 用内置地址; 非空且合法 = 只用用户配置的地址(可多个, 判断是否联网用)
 pub fn connectivity_test(client: &HttpClient, custom_probe: &str) -> (Option<bool>, String) {
-    let targets = probe_targets(custom_probe);
-    let (tx, rx) = mpsc::channel();
-    thread::scope(|s| {
-        for (host, path) in targets {
-            let tx = tx.clone();
-            s.spawn(move || {
-                let st = probe_one(client, &host, &path);
-                let _ = tx.send((host, path, st));
-            });
-        }
-        drop(tx);
-        let mut unreachable_msg = String::new();
-        for (host, path, st) in rx.iter() {
-            match st {
-                ProbeState::Online => {
-                    return (Some(true), format!("{host}{path}"));
-                }
-                ProbeState::Captive(loc) => {
-                    return (Some(false), loc);
-                }
-                ProbeState::Unreachable(e) => unreachable_msg = e,
-                ProbeState::Inconclusive => {}
-            }
-        }
-        // 无结论时注明只探测了 IPv4(客户端不解析 AAAA/不建 v6 socket),
-        // 免得学校推了 IPv6 后对着「无法判定」莫名其妙
-        let detail = if unreachable_msg.is_empty() {
-            "所有探测地址均无结论(仅探测 IPv4)".to_string()
-        } else {
-            format!("{unreachable_msg}(仅探测 IPv4)")
-        };
-        (None, detail)
+    match run_probes(client, custom_probe) {
+        ProbeState::Online => (Some(true), "探测通过".into()),
+        ProbeState::Captive(loc) => (Some(false), url_base(&loc)),
+        ProbeState::Mixed => (None, "探测结果冲突，暂缓认证".into()),
+        ProbeState::Unreachable(e) => (None, e),
+        ProbeState::Inconclusive => (None, "所有探测地址均无结论（仅 IPv4）".into()),
+    }
+}
+
+fn run_probes(client: &HttpClient, custom_probe: &str) -> ProbeState {
+    let targets = if custom_probe.trim().is_empty() {
+        login_probe_targets()
+    } else {
+        probe_targets(custom_probe)
+    };
+    thread::scope(|scope| {
+        let tasks: Vec<_> = targets
+            .into_iter()
+            .map(|(host, path)| scope.spawn(move || probe_one(client, &host, &path)))
+            .collect();
+        summarize_probes(
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap_or(ProbeState::Inconclusive)),
+        )
     })
 }
 
@@ -314,25 +406,6 @@ pub fn login_probe_targets() -> Vec<(String, String)> {
 
 /// 探测拿劫持 Location; 已在线返回标记。
 /// 没有劫持响应时回退到配置里的门户地址(portal_url), 都没有则返回 None。
-fn probe_for_login(
-    client: &HttpClient,
-    portal_url: &str,
-    log: &(dyn Fn(&str) + Sync),
-) -> (Option<String>, bool) {
-    for (host, path) in login_probe_targets() {
-        match probe_one(client, &host, &path) {
-            ProbeState::Online => return (None, true),
-            ProbeState::Captive(loc) => return (Some(loc), false),
-            _ => continue,
-        }
-    }
-    if let Some(p) = parse_portal_url(portal_url) {
-        (log)(&format!("探测不到劫持响应, 改用配置的门户地址: {p}"));
-        return (Some(p), false);
-    }
-    (None, false)
-}
-
 /// 校验并归一化手动填写的门户地址: 允许 http://host[/path...] 或裸 host/path
 pub fn parse_portal_url(s: &str) -> Option<String> {
     let t = s.trim();
@@ -344,15 +417,7 @@ pub fn parse_portal_url(s: &str) -> Option<String> {
     } else {
         format!("http://{t}")
     };
-    let host = url_host(&with_scheme);
-    if host.is_empty()
-        || !host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
-    {
-        return None;
-    }
-    Some(with_scheme)
+    portal_origin(&with_scheme).map(|_| with_scheme)
 }
 
 /// 跟随跳转抓取登录页, 返回 (最终 URL, HTML, Cookie)。最多 3 跳。
@@ -362,9 +427,14 @@ fn fetch_login_page(
     start_url: &str,
     ua: &str,
     log: &(dyn Fn(&str) + Sync),
+    trusted_origin: Option<&str>,
 ) -> Result<(String, String, String), String> {
     let mut url = start_url.to_string();
     for hop in 0..3 {
+        let origin = portal_origin(&url).ok_or("门户地址无效")?;
+        if trusted_origin.is_some_and(|trusted| trusted != origin) {
+            return Err(format!("门户跳转到了未确认的地址 {origin}"));
+        }
         let resp = client.request(
             "GET",
             &url,
@@ -378,16 +448,12 @@ fn fetch_login_page(
             ],
             None,
         )?;
-        if let Some(loc) = resp.header("Location") {
-            let l = loc.trim();
-            let next = if l.starts_with('/') {
-                format!("{}{}", url_base(&url), l)
-            } else if l.starts_with("http://") || l.starts_with("https://") {
-                l.to_string()
-            } else {
-                format!("{}/{}", url.trim_end_matches('/'), l)
-            };
-            (log)(&format!("  跳转 {url} -> {next}"));
+        if let Some(loc) = resp
+            .header("Location")
+            .filter(|_| (300..400).contains(&resp.status))
+        {
+            (log)("门户页面发生跳转");
+            let next = join_portal_location(&url, loc).ok_or("门户跳转地址无效")?;
             url = next;
             if hop == 2 {
                 return Err("跳转次数过多, 未拿到登录页".into());
@@ -420,7 +486,7 @@ pub fn detect_portal(
         if let ProbeState::Captive(url) = probe_one(client, &host, &path) {
             (log)(&format!("探测 {host}{path} -> 302 被劫持: {url}"));
             let base = url_base(&url);
-            match fetch_login_page(client, &url, UA_PC, log) {
+            match fetch_login_page(client, &url, UA_PC, log, None) {
                 Ok((final_url, html, _)) => (log)(&format!(
                     "  登录页{} (最终地址 {final_url})",
                     if looks_like_portal_page(&html) {
@@ -436,7 +502,7 @@ pub fn detect_portal(
     }
     if let Some(p) = parse_portal_url(portal_url) {
         (log)(&format!("无劫持响应, 验证手填的门户地址: {p}"));
-        if let Ok((final_url, html, _)) = fetch_login_page(client, &p, UA_PC, log) {
+        if let Ok((final_url, html, _)) = fetch_login_page(client, &p, UA_PC, log, None) {
             (log)(&format!(
                 "  可达, {} (最终地址 {final_url})",
                 if looks_like_portal_page(&html) {
@@ -456,14 +522,13 @@ pub fn detect_portal(
 /// Err(code,msg)=失败
 fn login_spa(
     client: &HttpClient,
+    line: &LineCfg,
     loc: &str,
     fields: &[(String, String)],
-    username: &str,
-    password: &str,
     ua: &str,
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<bool, (&'static str, String)> {
-    let base = url_base(loc);
+    let base = portal_origin(loc).ok_or(("untrusted-portal", "门户地址无效".into()))?;
     let auth_url = format!("{base}/portal/webauth/auth");
     let get = |k: &str| -> String {
         fields
@@ -476,8 +541,8 @@ fn login_spa(
     };
     let (ip, acip, acname) = (get("wlanuserip"), get("wlanacip"), get("wlanacname"));
     let mut pairs: Vec<(String, String)> = vec![
-        ("userId".to_string(), username.to_string()),
-        ("passwd".to_string(), password.to_string()),
+        ("userId".to_string(), line.username.clone()),
+        ("passwd".to_string(), line.password.clone()),
         ("loginMode".to_string(), "password".to_string()),
         ("wlanuserip".to_string(), ip.clone()),
         ("wlanacip".to_string(), acip.clone()),
@@ -492,9 +557,7 @@ fn login_spa(
         .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    (log)(&format!(
-        "  新版门户(SPA): POST {auth_url}  userId={username} passwd=*** loginMode=password wlanuserip={ip} wlanacip={acip} wlanacname={acname}"
-    ));
+    (log)("提交新版门户认证请求");
     let headers = [
         ("User-Agent", ua),
         ("Accept", "application/json, text/plain, */*"),
@@ -536,85 +599,79 @@ fn login_spa(
             (log)(&format!("  门户返回消息: {e}"));
             if e.contains("已在线") {
                 (log)("本机已在线, 无需重复认证");
-                save_gateway(&base, &acip, &acname);
+                save_gateway(&line.name, &base, &acip, &acname);
                 return Ok(true);
             }
         }
     }
-    save_gateway(&base, &acip, &acname);
+    save_gateway(&line.name, &base, &acip, &acname);
     Ok(false)
 }
 
 /// 认证成功后把「门户基地址 + 网关参数」记到 /tmp(tmpfs) 并持久化到 uci,
 /// 供 `offline` 子命令在线状态下直接调令牌 API 强制下线(在线时没有劫持响应可取这些参数)。
 /// /tmp 文件随重启丢失, uci 记录长期有效 —— 两条通道互补。
-fn save_gateway(base: &str, acip: &str, acname: &str) {
-    let v = serde_json::json!({ "base": base, "acip": acip, "acname": acname });
-    let tmp = format!("{GATEWAY_PATH}.tmp");
-    if std::fs::write(&tmp, serde_json::to_string(&v).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, GATEWAY_PATH);
-    }
-    // 持久化到 uci(uci 不可用时静默跳过, /tmp 文件仍可用)
-    let uci_set = |key: &str, val: &str| {
-        let _ = std::process::Command::new("uci")
-            .args(["set", &format!("portalkeeper.main.{key}={val}")])
-            .status();
-    };
-    uci_set("wlanacip", acip);
-    uci_set("wlanacname", acname);
-    // portal_url 留空时把门户基地址记进去(自动发现成功写回配置), 已填的不动;
-    // commit 无条件执行, 保证 wlanacip/wlanacname 总是落盘(portal_url 已填过时也需要)
-    let cur = std::process::Command::new("uci")
-        .args(["get", "portalkeeper.main.portal_url"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    if cur.is_empty() {
-        uci_set("portal_url", base);
-    }
-    let _ = std::process::Command::new("uci")
-        .args(["commit", "portalkeeper"])
-        .status();
+fn gateway_path(line: &str) -> String {
+    format!("{GATEWAY_PATH}-{line}.json")
 }
 
-/// 读取认证时记录的网关参数。回退链: /tmp 记录 → portal_url 完整 URL 的 query → uci 持久化记录
-fn saved_gateway(portal_url: &str) -> Option<(String, String, String)> {
-    if let Ok(text) = std::fs::read_to_string(GATEWAY_PATH) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-            let base = v["base"].as_str().unwrap_or("").to_string();
-            let acip = v["acip"].as_str().unwrap_or("").to_string();
-            let acname = v["acname"].as_str().unwrap_or("").to_string();
-            if !base.is_empty() && !acip.is_empty() && !acname.is_empty() {
-                return Some((base, acip, acname));
-            }
+fn save_gateway(line: &str, base: &str, acip: &str, acname: &str) {
+    if acip.is_empty() || acname.is_empty() {
+        return;
+    }
+    let path = gateway_path(line);
+    let value = serde_json::json!({"base": base, "acip": acip, "acname": acname}).to_string();
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    if std::fs::write(&tmp, &value).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    // Store each line independently so another line or a LuCI save cannot change its gateway.
+    let dir = "/etc/portalkeeper";
+    let persistent = format!("{dir}/gateway-{line}.json");
+    if std::fs::read_to_string(&persistent).ok().as_deref() == Some(&value) {
+        return;
+    }
+    let tmp = format!("{persistent}.{}.tmp", std::process::id());
+    if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, value).is_ok() {
+        let _ = std::fs::rename(&tmp, persistent);
+    }
+}
+
+fn saved_gateway(line: &LineCfg) -> Option<(String, String, String)> {
+    let trusted = parse_portal_url(&line.trusted_portal).and_then(|url| portal_origin(&url))?;
+    for path in [
+        gateway_path(&line.name),
+        format!("/etc/portalkeeper/gateway-{}.json", line.name),
+    ] {
+        let Some(record) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        else {
+            continue;
+        };
+        let (Some(base), Some(acip), Some(acname)) = (
+            record["base"].as_str(),
+            record["acip"].as_str(),
+            record["acname"].as_str(),
+        ) else {
+            continue;
+        };
+        if portal_origin(base).as_deref() == Some(&trusted)
+            && !acip.is_empty()
+            && !acname.is_empty()
+        {
+            return Some((trusted, acip.into(), acname.into()));
         }
     }
-    // 回退 1: portal_url 填的是完整登录页 URL(含 query)时, 参数直接从 query 取
-    let base = url_base(portal_url);
-    if !base.is_empty() {
-        if let (Some(acip), Some(acname)) = (
-            query_param(portal_url, "wlanacip"),
-            query_param(portal_url, "wlanacname"),
-        ) {
-            return Some((base, acip, acname));
-        }
+    let url = parse_portal_url(&line.portal_url)?;
+    if portal_origin(&url).as_deref() != Some(&trusted) {
+        return None;
     }
-    // 回退 2: uci 里认证时持久化的网关参数(服务重启/路由器重启后仍有效)
-    let cfg = crate::uci::Config::load("/etc/config/portalkeeper");
-    let m = cfg.first("portalkeeper");
-    let acip = m
-        .and_then(|s| crate::uci::get(s, "wlanacip"))
-        .unwrap_or("")
-        .to_string();
-    let acname = m
-        .and_then(|s| crate::uci::get(s, "wlanacname"))
-        .unwrap_or("")
-        .to_string();
-    if !base.is_empty() && !acip.is_empty() && !acname.is_empty() {
-        return Some((base, acip, acname));
-    }
-    None
+    Some((
+        trusted,
+        query_param(&url, "wlanacip")?,
+        query_param(&url, "wlanacname")?,
+    ))
 }
 
 /// 读网卡 MAC(/sys/class/net); device 缺省时用默认路由出口
@@ -647,7 +704,9 @@ pub fn force_offline(
     log: &(dyn Fn(&str) + Sync),
     timeout: Duration,
 ) -> Result<String, String> {
-    let Some((base, acip, acname)) = saved_gateway(&line.portal_url) else {
+    let clean = |message: &str| log(&redact_credentials(message, &line.username, &line.password));
+    let log = &clean;
+    let Some((base, acip, acname)) = saved_gateway(line) else {
         return Err(
             "没有记录到门户网关参数 —— 需先在校园网内认证一次(守护进程会自动记录); \
              旧版门户(表单式)不支持自动下线, 请打开自助管理后台手动操作"
@@ -742,14 +801,22 @@ pub fn force_offline(
         ));
     }
     let items = v["result"]["items"].as_array().cloned().unwrap_or_default();
-    let row = items
-        .iter()
-        .find(|it| {
-            let cid = it["callerId"].as_str().unwrap_or("").to_uppercase();
-            let bip = it["accountBindIp"].as_str().unwrap_or("");
-            cid == my_mac || bip == my_ip
+    let normalize = |mac: &str| mac.replace([':', '-'], "").to_ascii_uppercase();
+    let mac_match = items.iter().find(|row| {
+        row["callerId"]
+            .as_str()
+            .is_some_and(|mac| normalize(mac) == normalize(&my_mac))
+    });
+    let row = mac_match
+        .or_else(|| {
+            let mut matches = items.iter().filter(|row| {
+                row["accountBindIp"].as_str() == Some(&my_ip)
+                    && row["callerId"].as_str().is_none_or(str::is_empty)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
         })
-        .ok_or_else(|| "在线列表里没有找到本机 —— 可能已下线(无需操作), 或列表为空".to_string())?;
+        .ok_or_else(|| "在线列表里没有可靠匹配的本机会话".to_string())?;
     let row_ip = row["accountBindIp"].as_str().unwrap_or(&my_ip).to_string();
     let row_mac = row["callerId"].as_str().unwrap_or("").to_uppercase();
     (log)(&format!(
@@ -760,7 +827,7 @@ pub fn force_offline(
 
     // ---- 3. 强制下线(callerId 用在线行里的原始值转大写, 门户按大写匹配) ----
     let off_url = format!("{base}/api/portal/user/onlineUser/forceOffline");
-    let payload = format!(r#"{{"accountBindIp":"{row_ip}","callerId":"{row_mac}"}}"#);
+    let payload = serde_json::json!({"accountBindIp": row_ip, "callerId": row_mac}).to_string();
     (log)(&format!("第 3 步: POST {off_url}"));
     let resp = client
         .request(
@@ -803,44 +870,39 @@ pub fn authenticate(
         "mobile" => random_mobile_ua(),
         _ => UA_PC.to_string(),
     };
-    (log)(&format!(
-        "=== 开始认证: 账号={} 设备={} 槽位={} 出口={:?} 源IP={:?} ===",
-        line.username,
-        line.name,
-        line.ua,
-        line.device,
-        line.source
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "默认路由".into())
-    ));
-    (log)(&format!("本次 UA: {ua}"));
-
-    // ---- 第 1 步: 探测, 拿劫持 Location ----
-    let (loc, already) = probe_for_login(&client, &line.portal_url, log);
-    if already {
-        (log)("探测: 已放行, 本机已在线, 无需认证");
-        return (true, "already", "已在线".into());
-    }
+    let clean = |message: &str| log(&redact_credentials(message, &line.username, &line.password));
+    let log = &clean;
+    (log)(&format!("开始认证 · {} · {}", line.name, line.ua));
+    let loc = match run_probes(&client, &line.probe_url) {
+        ProbeState::Online => return (true, "already", "已在线".into()),
+        ProbeState::Mixed => return (false, "probe-conflict", "探测结果冲突，暂缓认证".into()),
+        ProbeState::Captive(loc) => Some(loc),
+        _ => parse_portal_url(&line.portal_url),
+    };
     let Some(loc) = loc else {
-        (log)("!! 探测不到门户劫持响应, 且未配置门户地址(portal_url)");
-        (log)("   手动获取办法: 浏览器打开任意 http 网站(如 http://www.msftconnecttest.com/connecttest.txt),");
-        (log)("   地址栏会跳到校园网认证页 — 把那个地址整条填进 LuCI「认证服务 → 门户地址」或用 uci 设置 portal_url");
         return (
             false,
             "no-portal",
-            "未探测到门户, 请手动填写门户地址(portal_url)".into(),
+            "未发现门户，请先确认并填写门户地址".into(),
         );
     };
-    (log)(&format!(
-        "第 1 步完成: 已取得会话绑定参数  Location = {loc}"
-    ));
-
-    // ---- 第 2 步: GET 登录页(跟随跳转), 种 Cookie + 动态解析字段 ----
-    let (loc, page_text, cookie) = match fetch_login_page(&client, &loc, &ua, log) {
-        Ok(v) => v,
+    let configured = parse_portal_url(&line.trusted_portal).and_then(|url| portal_origin(&url));
+    let candidate = portal_origin(&loc);
+    let Some(origin) = configured.filter(|expected| Some(expected) == candidate.as_ref()) else {
+        return (
+            false,
+            "untrusted-portal",
+            format!("请确认门户地址 {}", candidate.unwrap_or_default()),
+        );
+    };
+    let (loc, page_text, cookie) = match fetch_login_page(&client, &loc, &ua, log, Some(&origin)) {
+        Ok(page) => page,
         Err(e) => {
-            (log)(&format!("!! 获取登录页失败: {e}"));
-            return (false, "unreachable", format!("门户连接失败: {e}"));
+            return (
+                false,
+                "unreachable",
+                redact_credentials(&e, &line.username, &line.password),
+            )
         }
     };
     // 新版门户(SPA: 登录页只是 JS 外壳, 无表单)走接口; 判据 = 页面里有没有 password 输入框
@@ -848,18 +910,16 @@ pub fn authenticate(
     let (uf_opt, pf_opt) = detect_credential_fields(&inputs);
     if pf_opt.is_none() {
         let fields = parse_form_fields(&page_text);
-        match login_spa(
-            &client,
-            &loc,
-            &fields,
-            &line.username,
-            &line.password,
-            &ua,
-            log,
-        ) {
+        match login_spa(&client, line, &loc, &fields, &ua, log) {
             Ok(true) => return (true, "already", "已在线".into()),
-            Ok(false) => return recheck(&client, log),
-            Err((code, msg)) => return (false, code, msg),
+            Ok(false) => return recheck(&client, &line.probe_url, log),
+            Err((code, msg)) => {
+                return (
+                    false,
+                    code,
+                    redact_credentials(&msg, &line.username, &line.password),
+                )
+            }
         }
     }
     (log)(&format!(
@@ -929,18 +989,7 @@ pub fn authenticate(
         .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    let keys_dbg = form_pairs
-        .iter()
-        .map(|(k, v)| {
-            if k.eq_ignore_ascii_case("passwd") {
-                format!("{k}=***")
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    (log)(&format!("  表单明细: {keys_dbg}"));
+    (log)(&format!("旧版表单已解析（{} 个字段）", form_pairs.len()));
 
     let headers = [
         ("User-Agent", ua.as_str()),
@@ -971,31 +1020,51 @@ pub fn authenticate(
     if !errmsg.is_empty() {
         (log)(&format!("  门户返回消息: {errmsg}"));
         if BADPASS_KEYWORDS.iter().any(|k| errmsg.contains(k)) {
-            return (false, "badpass", errmsg);
+            return (
+                false,
+                "badpass",
+                redact_credentials(&errmsg, &line.username, &line.password),
+            );
         }
         if CONFLICT_KEYWORDS.iter().any(|k| errmsg.contains(k)) {
             (log)("!! 槽位冲突: 请到自助管理后台手动下线(本程序绝不自动顶号)");
-            return (false, "conflict", errmsg);
+            return (
+                false,
+                "conflict",
+                redact_credentials(&errmsg, &line.username, &line.password),
+            );
         }
     }
 
     // ---- 第 4 步: 复核放行(唯一可靠判定) ----
-    recheck(&client, log)
+    recheck(&client, &line.probe_url, log)
 }
 
 /// 复核放行: 等 3 秒再探测, 200/204 无重定向 = 已上线
-fn recheck(client: &HttpClient, log: &(dyn Fn(&str) + Sync)) -> (bool, &'static str, String) {
+pub fn redact_credentials(message: &str, username: &str, password: &str) -> String {
+    let mut text = message.to_string();
+    for value in [password, username]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+    {
+        text = text
+            .replace(&urlencode(value), "[已隐藏]")
+            .replace(value, "[已隐藏]");
+    }
+    text
+}
+
+fn recheck(
+    client: &HttpClient,
+    probe_url: &str,
+    log: &(dyn Fn(&str) + Sync),
+) -> (bool, &'static str, String) {
     for attempt in 1..=2 {
         (log)(&format!(
             "第 4 步: 等待 3 秒后复核放行 (第 {attempt}/2 次)..."
         ));
         thread::sleep(Duration::from_secs(3));
-        // 复核用与探测同一批地址(默认即内置第一个), 换过探测地址时行为一致
-        let (rh, rp) = login_probe_targets()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| (PROBE_URLS[0].0.to_string(), PROBE_URLS[0].1.to_string()));
-        match probe_one(client, &rh, &rp) {
+        match run_probes(client, probe_url) {
             ProbeState::Online => {
                 (log)("复核: 200/204 无重定向 -> 已放行");
                 (log)("=== 认证成功, 已上线! ===");
@@ -1017,9 +1086,9 @@ pub fn resolve_source(device: Option<&str>) -> Option<Ipv4Addr> {
         Some(socket2::Protocol::UDP),
     )
     .ok()?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(d) = device {
-        let _ = sock.bind_device(Some(d.as_bytes()));
+        sock.bind_device(Some(d.as_bytes())).ok()?;
     }
     let sa: std::net::SocketAddr = format!("{SOURCE_PROBE_HOST}:80").parse().ok()?;
     sock.connect(&SockAddr::from(sa)).ok()?;
@@ -1290,6 +1359,48 @@ pub fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_origin_pins_scheme_host_and_port() {
+        assert_eq!(
+            portal_origin("http://Campus.Example:80/portal").as_deref(),
+            Some("http://campus.example")
+        );
+        assert_ne!(
+            portal_origin("https://campus.example"),
+            portal_origin("http://campus.example")
+        );
+        assert_ne!(
+            portal_origin("http://campus.example:8080"),
+            portal_origin("http://campus.example")
+        );
+        assert!(portal_origin("http://campus.example@other.example").is_none());
+    }
+
+    #[test]
+    fn conflicting_probe_results_are_inconclusive_in_either_order() {
+        let redirected = || ProbeState::Captive("http://campus.example/portal".into());
+        assert!(matches!(
+            summarize_probes([ProbeState::Online, redirected()]),
+            ProbeState::Mixed
+        ));
+        assert!(matches!(
+            summarize_probes([redirected(), ProbeState::Online]),
+            ProbeState::Mixed
+        ));
+        assert!(!probe_response_is_online(
+            "www.msftconnecttest.com",
+            "/connecttest.txt",
+            200,
+            b"<html>portal</html>"
+        ));
+        assert!(probe_response_is_online(
+            "www.msftconnecttest.com",
+            "/connecttest.txt",
+            200,
+            b"Microsoft Connect Test"
+        ));
+    }
 
     #[test]
     fn same_host_redirect_is_not_captive() {

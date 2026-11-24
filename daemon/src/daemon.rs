@@ -111,6 +111,9 @@ struct LineRun {
     role: &'static str,
     device: Option<String>,
     source: Option<Ipv4Addr>,
+    fixed_source: Option<Ipv4Addr>,
+    trusted_portal: String,
+    last_probe: String,
     ua: String,
     username: String,
     password: String,
@@ -164,16 +167,27 @@ pub fn run(rest: &[String]) {
         .unwrap_or("")
         .to_string();
 
+    let get_main = |key| main.and_then(|m| uci::get(m, key)).unwrap_or("");
+    let trusted_portal = get_main("trusted_portal");
+    let fixed_source = get_main("source").parse().ok();
+
     // 线路 1: 主 WAN(基本设置), 段名 main
     let mut lines: Vec<LineRun> = vec![LineRun {
         name: "main".into(),
-        portal_url: portal_url.clone(),
+        portal_url: if trusted_portal.is_empty() {
+            portal_url.clone()
+        } else {
+            trusted_portal.into()
+        },
+        trusted_portal: trusted_portal.into(),
+        last_probe: String::new(),
         role: "主 WAN",
         device: main
             .and_then(|m| uci::get(m, "device"))
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
         source: None,
+        fixed_source,
         ua: main_ua.to_string(),
         username: main_user.to_string(),
         password: main_pass.to_string(),
@@ -186,18 +200,6 @@ pub fn run(rest: &[String]) {
         auth_fail: 0,
         last_fail: String::new(),
     }];
-    // 源 IP: 显式配置优先, 否则按网卡自动探测
-    if let Some(src) = main
-        .and_then(|m| uci::get(m, "source"))
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-    {
-        lines[0].source = Some(src);
-    } else {
-        let dev = lines[0].device.clone();
-        lines[0].source = portal::resolve_source(dev.as_deref());
-    }
-
     // 线路 2(高级设置): 段名 extra, enabled=1 才生效; 账号密码独立
     if let Some(sec) = cfg
         .sections_of("line")
@@ -210,14 +212,23 @@ pub fn run(rest: &[String]) {
                 .map(|s| s.to_string());
             let source = uci::get(sec, "source")
                 .filter(|s| !s.is_empty())
-                .and_then(|s| s.parse::<Ipv4Addr>().ok())
-                .or_else(|| portal::resolve_source(device.as_deref()));
+                .and_then(|s| s.parse::<Ipv4Addr>().ok());
+            let trusted = uci::get(sec, "trusted_portal")
+                .filter(|v| !v.is_empty())
+                .unwrap_or(trusted_portal);
             lines.push(LineRun {
                 name: "extra".into(),
-                portal_url: portal_url.clone(),
+                portal_url: if trusted.is_empty() {
+                    portal_url.clone()
+                } else {
+                    trusted.into()
+                },
+                trusted_portal: trusted.into(),
+                last_probe: String::new(),
                 role: "扩展线路",
                 device,
-                source,
+                source: None,
+                fixed_source: source,
                 ua: uci::get(sec, "ua")
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
@@ -290,9 +301,8 @@ pub fn run(rest: &[String]) {
             if stop_requested(started) {
                 exit(0);
             }
-            if trigger_fired() {
-                reset_retry(&mut lines);
-                monitor_all(&mut lines, retry_count, &probe_url);
+            if let Some(target) = take_trigger() {
+                monitor_trigger(&mut lines, retry_count, &probe_url, &target);
                 write_status(&lines, auto_retry, retry_interval, retry_count);
             }
         }
@@ -305,10 +315,8 @@ pub fn run(rest: &[String]) {
             exit(0);
         }
         let now = epoch_secs();
-        if trigger_fired() {
-            let _ = fs::remove_file(TRIGGER_PATH);
-            reset_retry(&mut lines);
-            monitor_all(&mut lines, retry_count, &probe_url);
+        if let Some(target) = take_trigger() {
+            monitor_trigger(&mut lines, retry_count, &probe_url, &target);
             write_status(&lines, auto_retry, retry_interval, retry_count);
             next = epoch_secs() + retry_interval;
             continue;
@@ -321,19 +329,20 @@ pub fn run(rest: &[String]) {
     }
 }
 
-fn trigger_fired() -> bool {
-    let ok = fs::metadata(TRIGGER_PATH).is_ok();
-    if ok {
-        let _ = fs::remove_file(TRIGGER_PATH);
-        logging::log("收到手动触发(/tmp/portalkeeper.trigger), 立即检测并尝试认证");
-    }
-    ok
+fn take_trigger() -> Option<String> {
+    let target = fs::read_to_string(TRIGGER_PATH).ok()?;
+    fs::remove_file(TRIGGER_PATH).ok()?;
+    Some(target.trim().to_string())
 }
 
-fn reset_retry(lines: &mut [LineRun]) {
-    for lr in lines.iter_mut() {
-        lr.exhausted = false;
-        lr.fail_count = 0;
+fn monitor_trigger(lines: &mut [LineRun], retry_count: u32, probe_url: &str, target: &str) {
+    for line in lines
+        .iter_mut()
+        .filter(|line| target == "1" || line.name == target)
+    {
+        line.exhausted = false;
+        line.fail_count = 0;
+        monitor(line, retry_count, probe_url);
     }
 }
 
@@ -360,6 +369,10 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
         lr.detail = "未配置账号密码".into();
         return;
     }
+    lr.source = lr
+        .fixed_source
+        .or_else(|| portal::resolve_source(lr.device.as_deref()));
+    lr.last_probe = logging::timestamp();
     let client = crate::http::HttpClient::new(lr.source, lr.device.clone(), Duration::from_secs(5));
     let (verdict, det) = portal::connectivity_test(&client, probe_url);
     match verdict {
@@ -375,7 +388,7 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
         Some(false) => {
             if lr.exhausted {
                 lr.state = "exhausted".into();
-                lr.detail = "自动重试次数已用完: 请排查后到顶部状态卡点「重启服务」重置".into();
+                lr.detail = "自动重试次数已用完: 请排查后点击该线路的「立即重试」重置".into();
                 logging::log(&format!("[{}] 处于暂停重试状态, 跳过本轮", lr.role));
                 return;
             }
@@ -391,6 +404,8 @@ fn monitor(lr: &mut LineRun, retry_count: u32, probe_url: &str) {
             let line = LineCfg {
                 name: lr.name.clone(),
                 portal_url: lr.portal_url.clone(),
+                trusted_portal: lr.trusted_portal.clone(),
+                probe_url: probe_url.to_string(),
                 device: lr.device.clone(),
                 source: lr.source,
                 username: lr.username.clone(),
@@ -463,6 +478,7 @@ fn write_status(lines: &[LineRun], auto_retry: bool, retry_interval: u64, retry_
                 "auth_ok": l.auth_ok,
                 "auth_fail": l.auth_fail,
                 "last_fail": l.last_fail,
+                "last_probe": l.last_probe,
             })
         })
         .collect();

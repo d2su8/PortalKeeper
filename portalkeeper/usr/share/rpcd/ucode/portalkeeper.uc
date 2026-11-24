@@ -61,7 +61,10 @@ function daemon_version() {
 
 function read_status() {
 	const uci = cursor();
-	const portal = uci.get('portalkeeper', 'main', 'portal_url') || '';
+	const portal = uci.get('portalkeeper', 'main', 'trusted_portal') || '';
+	const portal_url = (portal != '' && !match(portal, /^https?:\/\//)) ? 'http://' + portal : portal;
+	const origin = match(portal_url, /^(https?:\/\/[^\/?#]+)/);
+
 
 	const out = {
 		daemon_running: service_running(),
@@ -71,8 +74,7 @@ function read_status() {
 		version: daemon_version(),
 		enabled: uci.get('portalkeeper', 'main', 'enabled') == '1',
 		// 自助管理后台(新版门户是 /self/ 下的 SPA); 配了门户地址就按它拼
-		// 注意: 本固件 ucode 的字符串无 .replace 原型方法, 用全局 rtrim 去尾部斜杠
-		self_url: portal != '' ? rtrim(portal, '/') + '/self/' : DEFAULT_SELF_URL,
+		self_url: origin != null ? origin[1] + '/self/' : DEFAULT_SELF_URL,
 		lines: []
 	};
 
@@ -235,7 +237,7 @@ const methods = {
 	},
 
 	runcheck: {
-		args: { device: 'string', source: 'string' },
+		args: { device: 'string', source: 'string', line: 'string' },
 		call: function(req) {
 			// 可选指定某条线路(device/source)单独探测; 不传=按默认路由探测
 			let device = '';
@@ -254,7 +256,11 @@ const methods = {
 					source = req.args[1];
 			}
 
-			let extra = '';
+			const args = req.args;
+			const line = (type(args) == 'object') ? args.line : ((type(args) == 'array') ? args[2] : null);
+			if (line != null && line != '' && line != 'main' && line != 'extra')
+				return { output: '无效线路' };
+			let extra = ' --line ' + ((line == 'extra') ? 'extra' : 'main');
 
 			// 白名单校验: 参数会被拼进 shell 命令, 只放行网卡名与 IPv4
 			if (length(device) > 0) {
@@ -277,10 +283,13 @@ const methods = {
 	},
 
 	trigger: {
+		args: { line: 'string' },
 		call: function(req) {
-			writefile(TRIGGER_PATH, '1');
-
-			return { ok: true };
+			const args = req.args;
+			const line = (type(args) == 'object') ? args.line : ((type(args) == 'array') ? args[0] : null);
+			if (line != null && line != '' && line != 'main' && line != 'extra')
+				return { ok: false };
+			return { ok: writefile(TRIGGER_PATH, line || '1') != null };
 		}
 	},
 
@@ -331,8 +340,13 @@ const methods = {
 	// 强制下线本机(新版门户令牌 API, 由 portalkeeperd offline 完成):
 	// 拿令牌 → 查在线列表找本机 → forceOffline。耗时数秒, ubus 同步等待。
 	force_offline: {
+		args: { line: 'string' },
 		call: function(req) {
-			let out = exec(CLI + ' offline --timeout 10 2>&1');
+			const args = req.args;
+			const line = (type(args) == 'object') ? args.line : ((type(args) == 'array') ? args[0] : null);
+			if (line != null && line != '' && line != 'main' && line != 'extra')
+				return { output: '无效线路' };
+			let out = exec(CLI + ' offline --line ' + ((line == 'extra') ? 'extra' : 'main') + ' --timeout 10 2>&1');
 
 			if (out == null)
 				out = '无法执行 /usr/bin/portalkeeperd';

@@ -1,7 +1,7 @@
 # musl 静态链接(OpenWrt 各常见架构)。前提: PATH 中可找到对应的 <triple>-gcc 链接器。
 # 本地工具链取自 musl.cc 的 <triple>-cross 包(见 BUILD.md 第 0 步); 本地只装 aarch64 即可。
 # GitHub Actions 不下载 musl.cc(对 CI 不稳定), 改用 rust-cross 的 Docker 镜像,
-# 镜像内 gcc 名为 <rust triple>-gcc, 由工作流用 --config 覆盖本文件的 linker, 见 build.yml。
+# 工作流使用镜像的 TARGET_CC 覆盖本文件的链接器。
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"

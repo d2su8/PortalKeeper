@@ -167,7 +167,7 @@ cd ../build && ./build-ipk.sh && scp out/*.ipk root@192.168.5.1:/tmp/
 从 artifact 下载对应架构的包。tag 发布(版本号与 Cargo.toml 一致):
 
 ```bash
-git tag v1.3.1 && git push origin v1.3.1
+git tag -a v1.4.0 -m "PortalKeeper v1.4.0" && git push origin v1.4.0
 ```
 
 ---

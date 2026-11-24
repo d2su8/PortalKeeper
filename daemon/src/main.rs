@@ -33,6 +33,8 @@ fn usage() {
   portalkeeperd detect-portal     只探测门户地址(不登录); 探测不到会给出手动获取办法\n\
 选项(check/login 可用):\n\
   --config PATH                   UCI 配置文件(默认 /etc/config/portalkeeper)\n\
+  --line main|extra               选择认证线路
+\
   --source IP                     覆盖源 IP\n\
   --device NAME                   覆盖出口网卡(如 eth1)\n\
   --ua pc|mobile                  覆盖设备槽位\n\
@@ -74,118 +76,84 @@ fn resolve_line(rest: &[String]) -> (portal::LineCfg, String) {
     let cfg = uci::Config::load(
         &arg_value(rest, "--config").unwrap_or_else(|| "/etc/config/portalkeeper".to_string()),
     );
-    let main_sec = cfg.first("portalkeeper");
-
-    // 参数覆盖
-    let arg_source = arg_value(rest, "--source").and_then(|s| s.parse().ok());
-    let arg_device = arg_value(rest, "--device");
-    let arg_ua = arg_value(rest, "--ua").filter(|s| s == "pc" || s == "mobile");
-
-    let line = cfg
-        .sections_of("line")
-        .into_iter()
-        .find(|s| uci::get(s, "enabled").unwrap_or("1") != "0");
-
-    let pick = |from_line: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ),
-                from_main: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )| {
-        // (username, password, ua, device) 三级: 参数 > line > main
-        let (lu, lp, lua, ldev) = from_line;
-        let (mu, mp, mua, mdev) = from_main;
-        (
-            lu.or(mu).unwrap_or_default(),
-            lp.or(mp).unwrap_or_default(),
-            arg_ua.or(lua).or(mua).unwrap_or_else(|| "pc".into()),
-            arg_device.or(ldev).or(mdev),
-        )
+    let main = cfg.first("portalkeeper");
+    let get_main = |key| {
+        main.and_then(|section| uci::get(section, key))
+            .unwrap_or("")
     };
-
-    let (username, password, ua, device) = match line {
-        Some(sec) => pick(
-            (
-                uci::get(sec, "username")
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty()),
-                uci::get(sec, "password")
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty()),
-                uci::get(sec, "ua").map(|s| s.to_string()),
-                uci::get(sec, "device")
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty()),
-            ),
-            (
-                main_sec
-                    .and_then(|m| uci::get(m, "username"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "password"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "ua"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "device"))
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
-        ),
-        None => pick(
-            (None, None, None, None),
-            (
-                main_sec
-                    .and_then(|m| uci::get(m, "username"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "password"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "ua"))
-                    .map(|s| s.to_string()),
-                main_sec
-                    .and_then(|m| uci::get(m, "device"))
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
-        ),
+    let line_arg = arg_value(rest, "--line");
+    let extra = cfg.sections_of("line").into_iter().find(|section| {
+        section.name.as_deref() == Some("extra") && uci::get(section, "enabled") == Some("1")
+    });
+    let line = match line_arg.as_deref() {
+        Some("main") => None,
+        Some("extra") if extra.is_some() => extra,
+        Some(other) => {
+            eprintln!("线路不可用: {other}");
+            exit(2);
+        }
+        None => extra,
     };
-
-    let source = match arg_source {
-        Some(ip) => Some(ip),
-        None => portal::resolve_source(device.as_deref()),
+    let get_line = |key| {
+        line.and_then(|section| uci::get(section, key))
+            .filter(|v| !v.is_empty())
     };
-
-    let probe_url = main_sec
-        .and_then(|m| uci::get(m, "probe_url"))
-        .unwrap_or("")
-        .to_string();
-    // 门户地址: --portal 优先, 其次 uci 里的 portal_url
-    let portal_url = arg_value(rest, "--portal")
+    let inherited = |key| get_line(key).unwrap_or_else(|| get_main(key));
+    let device = arg_value(rest, "--device")
+        .filter(|v| !v.is_empty())
         .or_else(|| {
-            main_sec
-                .and_then(|m| uci::get(m, "portal_url"))
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
+            let configured = if line.is_some() {
+                get_line("device").unwrap_or("")
+            } else {
+                get_main("device")
+            };
+            (!configured.is_empty()).then(|| configured.to_string())
+        });
+    let source = arg_value(rest, "--source")
+        .or_else(|| {
+            if rest.iter().any(|a| a == "--device") {
+                return None;
+            }
+            let configured = if line.is_some() {
+                get_line("source").unwrap_or("")
+            } else {
+                get_main("source")
+            };
+            (!configured.is_empty()).then(|| configured.to_string())
         })
-        .unwrap_or_default();
-
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| portal::resolve_source(device.as_deref()));
+    let ua = arg_value(rest, "--ua")
+        .filter(|v| v == "pc" || v == "mobile")
+        .unwrap_or_else(|| {
+            get_line("ua")
+                .unwrap_or_else(|| {
+                    if line.is_some() {
+                        "mobile"
+                    } else {
+                        get_main("ua")
+                    }
+                })
+                .to_string()
+        });
+    let trusted_portal =
+        arg_value(rest, "--portal").unwrap_or_else(|| inherited("trusted_portal").to_string());
+    let portal_url = if trusted_portal.is_empty() {
+        get_main("portal_url").to_string()
+    } else {
+        trusted_portal.clone()
+    };
+    let probe_url = get_main("probe_url").to_string();
     (
         portal::LineCfg {
-            name: "cli".into(),
+            name: if line.is_some() { "extra" } else { "main" }.into(),
             portal_url,
+            trusted_portal,
+            probe_url: probe_url.clone(),
             device,
             source,
-            username,
-            password,
+            username: inherited("username").to_string(),
+            password: inherited("password").to_string(),
             ua,
         },
         probe_url,
@@ -328,7 +296,10 @@ fn cli_offline(rest: &[String]) {
             exit(0);
         }
         Err(e) => {
-            println!("结论: {e}");
+            println!(
+                "结论: {}",
+                portal::redact_credentials(&e, &line.username, &line.password)
+            );
             exit(1);
         }
     }

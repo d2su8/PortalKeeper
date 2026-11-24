@@ -17,6 +17,25 @@ static LOG: Mutex<Option<FileLog>> = Mutex::new(None);
 /// 初始化全局日志; 失败(如 /tmp 不可写)时静默降级为仅 stderr
 pub fn init(path: &str, max_bytes: u64) {
     adopt_system_timezone();
+    if let Ok(old_log) = fs::read_to_string(path) {
+        let clean = old_log
+            .split_inclusive('\n')
+            .filter(|line| {
+                ![
+                    "表单明细:",
+                    "账号=",
+                    "userId=",
+                    "门户返回:",
+                    "门户返回消息:",
+                ]
+                .iter()
+                .any(|tag| line.contains(tag))
+            })
+            .collect::<String>();
+        if clean != old_log {
+            let _ = fs::write(path, clean);
+        }
+    }
     let mut g = LOG.lock().unwrap();
     *g = Some(FileLog {
         path: PathBuf::from(path),

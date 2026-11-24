@@ -9,10 +9,11 @@
 var callGetStatus = rpc.declare({ object: 'portalkeeper', method: 'getstatus', expect: {} });
 var callGetIfaces = rpc.declare({ object: 'portalkeeper', method: 'getifaces', expect: {} });
 var callGetIfInfo = rpc.declare({ object: 'portalkeeper', method: 'getifinfo', params: [ 'device', 'source' ], expect: {} });
-var callRunCheck = rpc.declare({ object: 'portalkeeper', method: 'runcheck', params: [ 'device', 'source' ], expect: {} });
+var callRunCheck = rpc.declare({ object: 'portalkeeper', method: 'runcheck', params: [ 'device', 'source', 'line' ], expect: {} });
 var callGetLog = rpc.declare({ object: 'portalkeeper', method: 'getlog', expect: {} });
 var callClearLog = rpc.declare({ object: 'portalkeeper', method: 'clearlog', expect: {} });
-var callForceOffline = rpc.declare({ object: 'portalkeeper', method: 'force_offline', expect: {} });
+var callForceOffline = rpc.declare({ object: 'portalkeeper', method: 'force_offline', params: [ 'line' ], expect: {} });
+var callTrigger = rpc.declare({ object: 'portalkeeper', method: 'trigger', params: [ 'line' ], expect: {} });
 // 重启服务(等价 /etc/init.d/portalkeeper restart): 改完账号/网卡等配置后让改动立即生效
 var callApply = rpc.declare({ object: 'portalkeeper', method: 'apply', expect: {} });
 
@@ -22,6 +23,8 @@ var SELF_URL = 'http://10.255.2.249/self/';
 // 项目主页(版本号链接指向这里)
 var REPO_URL = 'https://github.com/d2su8/PortalKeeper';
 
+var panelView = null;
+var panelKey = null;
 var statusBodyEl = null;     // 状态卡动态部分(运行状态/开关/运行统计, 5 秒轮询重绘)
 var checkDetailEl = null;    // 主线路探测的原始输出
 var panelsBoxEl = null;      // 线路信息
@@ -54,10 +57,10 @@ function lineDefs(status) {
 	for (var i = 0; i < slines.length; i++)
 		byName[slines[i].name || ''] = slines[i];
 
-	var keys = [ [ 'main', '线路一(主线路)' ] ];
+	var keys = [ [ 'main', _('主 WAN') ] ];
 
 	if (uci.get('portalkeeper', 'extra', 'enabled') == '1')
-		keys.push([ 'extra', '线路二(扩展线路)' ]);
+		keys.push([ 'extra', _('扩展线路') ]);
 
 	var defs = [];
 
@@ -70,6 +73,9 @@ function lineDefs(status) {
 			title: keys[j][1],
 			device: uci.get('portalkeeper', name, 'device') || s.device || '',
 			source: uci.get('portalkeeper', name, 'source') || s.source || '',
+			configuredSource: uci.get('portalkeeper', name, 'source') || '',
+			lastProbe: s.last_probe || '',
+			ua: s.ua || uci.get('portalkeeper', name, 'ua') || (name == 'extra' ? 'mobile' : 'pc'),
 			state: s.state || null,
 			detail: s.detail || ''
 		});
@@ -197,7 +203,7 @@ function renderCheckDetail(chk) {
 // 5 秒轮询会重绘状态卡, 若连 details 一起重建, 用户展开的日志会被打回收起
 // (新 details 元素默认收起, 表现为「自己回弹」); 探测输出只在测试完成时变化,
 // 没有跟着轮询重绘的必要
-function paintCheckDetail() {
+function paintCheckDetail(index) {
 	if (!checkDetailEl)
 		return;
 
@@ -209,7 +215,7 @@ function paintCheckDetail() {
 		wasOpen = old.open;
 
 	checkDetailEl.innerHTML = '';
-	checkDetailEl.appendChild(renderCheckDetail(checks[0]));
+	checkDetailEl.appendChild(renderCheckDetail(checks[index || 0]));
 
 	if (wasOpen) {
 		var now = checkDetailEl.querySelector('details');
@@ -218,40 +224,41 @@ function paintCheckDetail() {
 	}
 }
 
-// 线路信息: 每条线路一列(两条线路时左右并排), 只列 网卡 / IP / MAC + 本线路联网状态
-function lineCol(def, info, chk) {
-	var kids = [
-		E('h4', { 'style': 'margin:6px 0 4px' }, def.title),
-		hrow([
-			chip('网卡:', info.device || def.device || '自动检测'),
-			chip('IP 地址:', info.ip || '-'),
-			chip('MAC 地址:', info.mac || '-'),
-			E('span', {}, [
-				E('span', { 'class': 'cbi-value-description' }, '联网状态 '),
-				checking
-					? E('span', { 'class': 'label', 'style': 'color:' + vColor('warning') }, '检测中...')
-					: badge(checkVerdict(chk ? chk.output : null))
-			])
+function lineCol(def, info, chk, view) {
+	var states = {
+		online: [ 'success', _('已在线') ],
+		retrying: [ 'warning', _('等待重试') ],
+		exhausted: [ 'danger', _('重试已暂停') ],
+		unreachable: [ 'warning', _('探测无结论') ],
+		'no-credentials': [ 'warning', _('待配置') ]
+	};
+	var verdict = chk ? checkVerdict(chk.output) : (states[def.state] || [ 'warning', _('尚未探测') ]);
+	var active = lastStatus && lastStatus.daemon_running === true;
+
+	return E('article', { 'class': 'cbi-section pk-line-card' }, [
+		E('header', { 'class': 'pk-line-heading' }, [ E('h4', {}, def.title), badge(verdict) ]),
+		E('dl', { 'class': 'pk-line-facts' }, [
+			E('dt', {}, _('出口网卡')), E('dd', {}, info.device || def.device || _('自动选择')),
+			E('dt', {}, _('IPv4')), E('dd', {}, def.source || info.ip || '—'),
+			E('dt', {}, _('设备槽位')), E('dd', {}, def.ua == 'mobile' ? _('手机槽') : _('电脑槽')),
+			E('dt', {}, _('最近探测')), E('dd', {}, def.lastProbe || '—')
+		]),
+		def.detail && def.state != 'online' ? E('p', { 'class': 'cbi-value-description' }, def.detail) : '',
+		E('div', { 'class': 'pk-line-actions' }, [
+			E('button', { 'class': 'btn cbi-button cbi-button-action', 'type': 'button',
+				'click': ui.createHandlerFn(view, 'handleLineCheck', def.name) }, _('探测')),
+			E('button', Object.assign({ 'class': 'btn cbi-button cbi-button-action', 'type': 'button',
+				'click': ui.createHandlerFn(view, 'handleRetry', def.name) }, active ? {} : { 'disabled': '' }), _('立即重试')),
+			E('button', { 'class': 'btn cbi-button cbi-button-negative', 'type': 'button',
+				'click': ui.createHandlerFn(view, 'handleForceOffline', def.name) }, _('下线'))
 		])
-	];
-
-	// 认证异常(未配置账号密码/认证失败/重试用完)才补一行说明, 正常在线不显示
-	if (def.state && def.state != 'online' && def.detail)
-		kids.push(E('div', { 'class': 'cbi-value-description', 'style': 'font-size:12px; margin-top:4px' }, def.detail));
-
-	return E('div', { 'style': 'flex:1 1 340px; min-width:280px' }, kids);
+	]);
 }
 
 function renderPanels() {
-	if (lines.length == 0)
-		return E('em', {}, '暂无线路数据');
-
-	var cols = [];
-
-	for (var i = 0; i < lines.length; i++)
-		cols.push(lineCol(lines[i], infos[i] || {}, checks[i]));
-
-	return hrow(cols, 'align-items:flex-start');
+	return E('div', { 'class': 'pk-line-grid' }, lines.map(function(line, i) {
+		return lineCol(line, infos[i] || {}, checks[i], panelView);
+	}));
 }
 
 // 逐条线路探测(带该线路的网卡/源 IP, 各探各的)
@@ -259,7 +266,7 @@ function probeLines(defs) {
 	var reqs = [];
 
 	for (var i = 0; i < defs.length; i++)
-		reqs.push(callRunCheck(defs[i].device || '', defs[i].source || '').catch(function(e) {
+		reqs.push(callRunCheck(defs[i].device || '', defs[i].configuredSource || '', defs[i].name).catch(function(e) {
 			return { output: '网络联通测试执行失败: ' + e };
 		}));
 
@@ -289,6 +296,11 @@ function paintStatus(status) {
 
 function paintPanels() {
 	if (panelsBoxEl) {
+		var key = JSON.stringify([ lines, checks, lastStatus && lastStatus.daemon_running,
+			infos.map(function(info) { return [ info.device, info.ip ]; }) ]);
+		if (key == panelKey)
+			return;
+		panelKey = key;
 		panelsBoxEl.innerHTML = '';
 		panelsBoxEl.appendChild(renderPanels());
 	}
@@ -368,7 +380,7 @@ function buildAuthMap(ifaces, extras) {
 	o.datatype = 'or(ip4addr, "")';
 	o.rmempty = true;
 
-	o = s.option(form.ListValue, 'ua', _('设备认证类型'),
+	o = s.option(form.ListValue, 'ua', _('设备槽位'),
 		'tip: 校园网按设备槽位计数(1 电脑 + 1 手机), 认证类型在每次建立 MAC 绑定时确定。' +
 		'如需切换槽位: 先在「概览」里强制下线本机(清除绑定), 再回来重新认证。');
 	o.value('pc', _('电脑端 (PC 槽)'));
@@ -394,7 +406,7 @@ function buildAuthMap(ifaces, extras) {
 	o.depends('auto_retry', '1');
 
 	o = s.option(form.Value, 'probe_url', _('自定义探测网站'),
-		'tip: 判断「有没有联网」时探测的网站, 可填多个(用逗号分隔, 任一可达即算联网)。' +
+		'tip: 判断「有没有联网」时探测的网站, 可用逗号分隔多个地址。信号冲突时显示无结论。' +
 		'留空 = 用内置地址(www.msftconnecttest.com/connecttest.txt 等); 填了则只用你设置的。' +
 		'建议填返回 200/204 的地址且支持明文 HTTP, 如 connect.rom.miui.com/generate_204; ' +
 		'只写域名时按「http://域名/」访问。');
@@ -402,14 +414,10 @@ function buildAuthMap(ifaces, extras) {
 	o.rmempty = true;
 	o.placeholder = 'www.msftconnecttest.com/connecttest.txt';
 
-	o = s.option(form.Value, 'portal_url', _('门户地址'),
-		'tip: 认证服务器地址。留空 = 自动发现(未认证时网关会 302 劫持, 程序直接跟着跳转地址走, ' +
-		'换学校通常不用填); 探测不到时才需要手填 —— 浏览器打开任意 http 网站(如 ' +
-		'http://www.msftconnecttest.com/connecttest.txt), 把地址栏跳转后的地址整条粘过来。' +
-		'认证成功后会自动把门户地址记录到这一项(强制下线功能要用), 可以手动改动。');
-	o.default = '';
+	o = s.option(form.Value, 'trusted_portal', _('已确认的门户地址'),
+		_('核对校园网浏览器中的认证地址后填写。保存并应用后，服务仅向该地址所属的门户提交凭据。'));
 	o.rmempty = true;
-	o.placeholder = 'http://10.10.0.1 (留空=自动发现)';
+	o.placeholder = 'http://10.10.0.1';
 
 	return m;
 }
@@ -452,11 +460,15 @@ function buildAdvancedMap(ifaces, extras) {
 	o.rmempty = true;
 	o.depends('enabled', '1');
 
-	o = s.option(form.ListValue, 'ua', _('设备认证类型'),
+	o = s.option(form.ListValue, 'ua', _('设备槽位'),
 		'tip: 该线路占用的设备槽位, 与主线路互不影响(如主 WAN 占电脑槽, 这里占手机槽)。');
 	o.value('pc', _('电脑端 (PC 槽)'));
 	o.value('mobile', _('手机端 (手机槽)'));
 	o.default = 'mobile';
+	o.depends('enabled', '1');
+
+	o = s.option(form.Value, 'trusted_portal', _('已确认的门户地址'), _('留空时沿用主 WAN 的确认地址。'));
+	o.rmempty = true;
 	o.depends('enabled', '1');
 
 	return m;
@@ -526,8 +538,30 @@ return view.extend({
 	},
 
 	// 强制下线本机(新版门户令牌 API, 守护进程自动完成拿令牌→查本机→下线)
-	handleForceOffline: function() {
-		return callForceOffline().then(function(res) {
+	handleLineCheck: function(name) {
+		var i = lines.findIndex(function(line) { return line.name == name; });
+		if (i < 0 || checking)
+			return;
+		checking = true;
+		return probeLines([lines[i]]).then(function(result) {
+			checks[i] = result[0];
+			paintCheckDetail(i);
+		}).finally(function() {
+			checking = false;
+			paintPanels();
+		});
+	},
+
+	handleRetry: function(name) {
+		return callTrigger(name).then(function(result) {
+			ui.addNotification(null, E('p', {}, result && result.ok ? _('已请求线路重试') : _('无法请求线路重试')));
+		});
+	},
+
+	handleForceOffline: function(name) {
+		if (!window.confirm(_('下线所选线路的本机会话？启用自动重试时，服务可能会重新连接。')))
+			return;
+		return callForceOffline(name).then(function(res) {
 			var out = (res && res.output) ? res.output : '(无输出)';
 
 			if (offlineOutEl) {
@@ -544,14 +578,16 @@ return view.extend({
 	// (账号/网卡/门户地址等改动保存后, 点这里重启即按新配置运行)
 	handleRestart: function() {
 		return callApply().then(function() {
-			ui.showNotification(_('认证服务已重启'), 3000);
-
-			return callGetStatus().catch(function() { return lastStatus; }).then(function(d) {
-				lastStatus = d;
-				paintStatus(d);
-			});
+			return callGetStatus();
+		}).then(function(status) {
+			lastStatus = status;
+			lines = lineDefs(status);
+			paintStatus(status);
+			paintPanels();
+			ui.addNotification(null, E('p', {}, status.daemon_running
+				? _('服务已运行') : _('已请求重启，服务尚未运行，请查看日志')));
 		}).catch(function(e) {
-			ui.showNotification(_('重启失败: ') + e, 5000);
+			ui.addNotification(null, E('p', {}, _('无法获取服务状态') + ' ' + e));
 		});
 	},
 
@@ -603,6 +639,8 @@ return view.extend({
 		var version = (data.status && data.status.version) ? data.status.version : '';
 
 		var self = this;
+		panelView = self;
+		panelKey = null;
 
 		// 三个表单各自渲染(异步): 启用开关放进状态卡, 账号参数/第二线路放各自标签页
 		return Promise.all([
@@ -616,6 +654,11 @@ return view.extend({
 
 			var view = E('div', { 'class': 'cbi-map' }, [
 				E('h2', {}, 'PortalKeeper'),
+				E('style', {}, '.pk-line-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,19rem),1fr));gap:1rem}' +
+					'.pk-line-card{margin:0;padding:1rem;border:1px solid var(--border-color,#8885);border-radius:.5rem}' +
+					'.pk-line-heading,.pk-line-actions{display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap}' +
+					'.pk-line-heading h4{margin:.25em 0}.pk-line-facts{display:grid;grid-template-columns:7em minmax(0,1fr);gap:.4em .8em;margin:1em 0}' +
+					'.pk-line-facts dd{margin:0;overflow-wrap:anywhere}.pk-line-actions{justify-content:flex-start}'),
 				// 一句话描述 + 版本号(红色链接, 点开跳 GitHub)
 				E('div', { 'class': 'cbi-map-descr' }, [
 					_('zaxsoft(石斧软件) portal 校园网认证小工具 —— 开机自动认证, 掉线自动重连。'),
@@ -668,22 +711,10 @@ return view.extend({
 						(checkDetailEl = E('div', { 'id': 'portalkeeper-check-detail', 'style': 'margin-top:4px' }))
 					]),
 					E('div', { 'class': 'cbi-section' }, [
-						E('h3', {}, _('下线指引')),
 						hrow([
-							E('button', {
-								'class': 'btn cbi-button cbi-button-negative',
-								'title': '通过门户令牌 API 强制下线本机(需先认证过一次); 下线后守护进程会按「掉线自动重试」配置自动重连',
-								'click': ui.createHandlerFn(self, 'handleForceOffline')
-							}, _('强制下线本机')),
-							E('button', {
-								'class': 'btn cbi-button cbi-button-action',
-								'click': ui.createHandlerFn(self, 'handleOfflineGuide')
-							}, _('打开自助管理后台(下线)')),
-							spacer(),
-							E('span', { 'class': 'cbi-value-description', 'style': 'font-size:12px; flex:1 1 420px' },
-								'「强制下线本机」自动完成拿令牌→查本机→下线, 适合换槽位前释放本机; ' +
-								'下线后守护进程会按「掉线自动重试」配置自动重新认证, 如需保持下线请先到顶部状态卡取消「启用」并保存应用。' +
-								'换槽位必须清除绑定, 可到自助后台「在线设备」对本机执行「按 MAC 下线(清除绑定)」。本插件不自动顶号。')
+							E('h3', {}, _('门户管理')),
+							E('button', { 'class': 'btn cbi-button cbi-button-action',
+								'click': ui.createHandlerFn(self, 'handleOfflineGuide') }, _('打开自助管理'))
 						]),
 						(offlineOutEl = E('div', { 'id': 'portalkeeper-offline-out', 'style': 'margin-top:6px' }))
 					])
@@ -729,6 +760,7 @@ return view.extend({
 			poll.add(L.bind(function() {
 				return callGetStatus().catch(function() { return lastStatus; }).then(function(d) {
 					lastStatus = d;
+					lines = lineDefs(d);
 
 					return fetchInfos(lines).then(function(list) {
 						infos = list;

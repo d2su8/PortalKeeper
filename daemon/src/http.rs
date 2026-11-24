@@ -57,19 +57,39 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: Option<&str>,
     ) -> Result<HttpResponse, String> {
-        let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("仅支持 http URL: {url}"))?;
-        let (hostport, path) = match rest.find('/') {
-            Some(p) => (&rest[..p], &rest[p..]),
-            None => (rest, "/"),
+        if url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+        {
+            return Err("HTTP 地址包含无效字符".into());
+        }
+        let rest = url.strip_prefix("http://").ok_or("仅支持 HTTP 门户")?;
+        let rest = rest.split('#').next().unwrap_or(rest);
+        let boundary = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(boundary);
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
         };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h, p.parse::<u16>().unwrap_or(80))
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => {
+                let port = port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| *value != 0)
+                    .ok_or("HTTP 端口无效")?;
+                (host, port)
             }
-            _ => (hostport, 80),
+            None => (authority, 80),
         };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+        {
+            return Err("HTTP 主机无效".into());
+        }
 
         let target = (host, port)
             .to_socket_addrs()
@@ -79,10 +99,11 @@ impl HttpClient {
 
         let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|e| format!("创建 socket 失败: {e}"))?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(dev) = &self.device {
             // SO_BINDTODEVICE 需 root; OpenWrt 守护进程默认 root
-            let _ = sock.bind_device(Some(dev.as_bytes()));
+            sock.bind_device(Some(dev.as_bytes()))
+                .map_err(|e| format!("绑定出口网卡 {dev} 失败: {e}"))?;
         }
         if let Some(src) = self.source {
             sock.bind(&SockAddr::from(std::net::SocketAddr::from((src, 0))))
